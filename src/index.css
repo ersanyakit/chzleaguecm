@@ -1,0 +1,216 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  /* Overwrite default black/zinc palettes with the elegant light Bento Grid palette */
+  --color-zinc-950: #ffffff;
+  --color-zinc-900: #f5f6fc;
+  --color-zinc-850: #eaeaee;
+  --color-zinc-800: #e2e8f0;
+  --color-zinc-700: #64748b;
+  --color-zinc-650: #475569;
+  --color-zinc-600: #475569;
+  --color-zinc-500: #64748b;
+  --color-zinc-400: #334155;
+  --color-zinc-300: #1e293b;
+  --color-zinc-200: #111822; /* High contrast body text color */
+  --color-zinc-100: #111822; /* Main text color */
+  --color-zinc-50: #0f172a;
+}
+
+@layer utilities {
+  /* Dynamic continuous marquee effect for football news gossip feed */
+  @keyframes marquee {
+    0% { transform: translateX(100%); }
+    100% { transform: translateX(-100%); }
+  }
+  
+  .animate-marquee {
+    display: inline-block;
+    animation: marquee 35s linear infinite;
+  }
+}
+
+/* Base Light Body Reset for Bento Theme */
+body {
+  background-color: #F7F8FA !important;
+  color: #191D24 !important;
+  font-family: "Inter", sans-serif !important;
+}
+
+/* Ensure all screen frames use the Bento Grid pale gray-blue background */
+.min-h-screen, 
+div.min-h-screen,
+div[class*="bg-zinc-950"],
+div[class*="bg-[#07080A]"] {
+  background-color: #F7F8FA !important;
+  color: #191D24 !important;
+}
+
+/* Force light text replacements for system readability */
+.text-zinc-100, .text-zinc-105 {
+  color: #191D24 !important;
+}
+.text-zinc-200 {
+  color: #2D3139 !important;
+}
+.text-zinc-300 {
+  color: #374151 !important;
+}
+.text-zinc-400 {
+  color: #6B7280 !important;
+}
+.text-zinc-500 {
+  color: #94A3B8 !important;
+}
+.text-zinc-650 {
+  color: #64748B !important;
+}
+
+/* 
+   Transform dark glass cards to elegant White Bento Grid modules 
+   Features subtle border, card shadow-sm and modern 32px rounded corners 
+*/
+.bg-zinc-950\/40, 
+.bg-zinc-900\/90, 
+.bg-zinc-900\/40,
+.bg-zinc-950\/20,
+.bg-zinc-900\/20,
+.bg-zinc-900\/30,
+.bg-zinc-950\/60,
+.bg-gradient-to-b.from-zinc-900.to-zinc-950 {
+  background-color: #ffffff !important;
+  background-image: none !important;
+  border-width: 1px !important;
+  border-color: #E2E8F0 !important;
+  border-radius: 24px !important;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05), 0 1px 2px -1px rgba(0, 0, 0, 0.05) !important;
+}
+
+@media (min-width: 640px) {
+  .bg-zinc-950\/40, 
+  .bg-zinc-900\/90, 
+  .bg-zinc-900\/40,
+  .bg-zinc-950\/20,
+  .bg-zinc-900\/20,
+  .bg-zinc-900\/30,
+  .bg-zinc-950\/60,
+  .bg-gradient-to-b.from-zinc-900.to-zinc-950 {
+    border-radius: 32px !important;
+  }
+}
+
+/* Header strip profile and news ticker stylings */
+div[class*="bg-zinc-950 border-b border-zinc-900"] {
+  background-color: #ffffff !important;
+  border-bottom: 1px solid #E2E8F0 !important;
+}
+
+div[class*="bg-zinc-950 p-4 sm:p-5 rounded-3xl"] {
+  background-color: #ffffff !important;
+  border: 1px solid #E2E8F0 !important;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.03), 0 2px 4px -2px rgba(0, 0, 0, 0.03) !important;
+}
+
+/* Visual list sub-components - emails list, player rows background states */
+.hover\:bg-zinc-900\/30:hover {
+  background-color: #F1F5F9 !important;
+}
+.hover\:bg-zinc-900\/50:hover {
+  background-color: #F1F5F9 !important;
+}
+.bg-zinc-900\/10 {
+  background-color: #F8FAFC !important;
+}
+.bg-zinc-900\/15 {
+  background-color: #F5F6FC !important;
+}
+.bg-zinc-900\/20 {
+  background-color: #F8FAFC !important;
+}
+.bg-zinc-900\/45 {
+  background-color: #F1F5F9 !important;
+}
+.bg-zinc-900\/60 {
+  background-color: #F1F5F9 !important;
+}
+
+/* Ensure table structures and scroll containers stand out */
+table tr {
+  border-bottom-color: #E5E7EB !important;
+}
+
+/* Form, Inputs, Select Boxes style integration */
+input, select, textarea {
+  background-color: #F5F6FC !important;
+  color: #191D24 !important;
+  border: 1px solid #E2E8F0 !important;
+  border-radius: 12px !important;
+}
+input:focus, select:focus, textarea:focus {
+  border-color: #FF007A !important;
+  background-color: #FFFFFF !important;
+  outline: none !important;
+}
+
+/* Custom interactive navigation pill elements */
+div[class*="bg-zinc-950 rounded-2xl border"] {
+  background-color: #ffffff !important;
+  border: 1px solid #E2E8F0 !important;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.03) !important;
+}
+
+/* Active tab menu button stylings */
+button[class*="bg-zinc-900 text-white border"] {
+  background-color: #F5F6FC !important;
+  border-color: #E2E8F0 !important;
+  color: #FF007A !important;
+  box-shadow: inset 0 1px 1px 0 rgba(0, 0, 0, 0.02) !important;
+}
+
+/* Mini custom labels */
+.bg-zinc-950, .bg-zinc-900 {
+  background-color: #F5F6FC !important;
+}
+
+/* Tactical pitch visualization styling */
+.from-emerald-950\/80 {
+  background-image: linear-gradient(to bottom, #10B981, #059669) !important;
+}
+.to-emerald-950\/20 {
+  background-image: none !important;
+}
+.border-emerald-500\/10 {
+  border-color: rgba(255, 255, 255, 0.25) !important;
+}
+
+/* Player badge spherical icons inside match simulation and tactics pitch */
+div[class*="rounded-full bg-zinc-950 border-2"] {
+  background-color: #FFFFFF !important;
+  color: #191D24 !important;
+  border-color: #FF007A !important;
+  box-shadow: 0 4px 10px rgba(255, 0, 122, 0.15) !important;
+}
+
+/* Custom Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 60px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #E2E8F0 !important;
+  border-radius: 99px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #FF007A !important;
+}
+

@@ -1,0 +1,6 @@
+{
+  "name": "Championship Manager: Retro",
+  "description": "TheSportsDB ve Gemini AI destekli, Uniswap kalitesinde arayüze sahip üst düzey menajerlik simülasyonu oyunu.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
