@@ -13,6 +13,7 @@ interface PitchPlayer {
   y: number; // percentage (0 - 100)
   rating: number;
   number: number;
+  restartAction?: 'THROW_IN';
 }
 
 interface MiniPass {
@@ -42,7 +43,7 @@ interface ThreeDPitchProps {
   homeClub: { name: string; badge: string; shortName: string };
   awayClub: { name: string; badge: string; shortName: string };
   possession: number; // home possession percentage
-  fxState: { type: 'GOAL' | 'SAVE' | 'MISS' | 'CARD' | 'RED_CARD' | 'FOUL' | 'INJURY' | 'NONE'; text?: string; team?: string; x?: number; y?: number } | null;
+  fxState: { type: 'GOAL' | 'SAVE' | 'MISS' | 'CARD' | 'RED_CARD' | 'FOUL' | 'INJURY' | 'NONE'; text?: string; team?: string; x?: number; y?: number; shotFromX?: number; shotFromY?: number; goalHeight?: number; eventKey?: number } | null;
   ballPossessorId?: string | null;
 }
 
@@ -86,6 +87,8 @@ export default function ThreeDPitch({
   const ballTargetPosRef = useRef({ x: 0, z: 0 });
   const prevPropsBall = useRef({ x: 50, y: 50 });
   const lastBallImpulseAtRef = useRef(0);
+  const activeGoalShotKeyRef = useRef<string | null>(null);
+  const goalShotStartedAtRef = useRef(0);
 
   const fxStateRef = useRef(fxState);
   useEffect(() => {
@@ -137,16 +140,17 @@ export default function ThreeDPitch({
   // Listen for ball ticks from simulation loop to apply gorgeous real kick impulses!
   useEffect(() => {
     let c = mapCoords(ball.x, ball.y);
+    const hasControlledBall = Boolean(ballPossessorIdRef.current && fxState?.type !== 'GOAL');
 
-    // Intercept if there is a pending or active GOAL to force ball target deep inside the 3D net!
+    // Intercept goals as a two-stage shot: first launch from the shooter, then settle in the net.
     if (fxState && fxState.type === 'GOAL') {
       const isHomeScoring = fxState.team === 'home';
       // Home team scores on awayGoal (Z = 19.5, net back wall at 20.4)
       // Away team scores on homeGoal (Z = -19.5, net back wall at -20.4)
-      const goalZ = isHomeScoring ? 20.3 : -20.3;
+      const goalZ = isHomeScoring ? 20.12 : -20.12;
 
       // Map ball.y (0..100) to the goal width [-2.5, 2.5] (inside posts which are at [-3.25, 3.25])
-      const goalWidthX = (ball.y / 100.0) * 5.0 - 2.5;
+      const goalWidthX = (ball.y / 100.0) * 6.0 - 3.0;
       c = { x: goalWidthX, z: goalZ };
     }
 
@@ -154,10 +158,47 @@ export default function ThreeDPitch({
     const dist = Math.hypot(c.x - prevC.x, c.z - prevC.z);
 
     ballTargetPosRef.current = { x: c.x, z: c.z };
+    const now = performance.now();
+
+    if (hasControlledBall) {
+      prevPropsBall.current = { ...ball };
+      ballPhysicsRef.current.x = c.x;
+      ballPhysicsRef.current.y = 0.235;
+      ballPhysicsRef.current.z = c.z;
+      ballPhysicsRef.current.vx = 0;
+      ballPhysicsRef.current.vy = 0;
+      ballPhysicsRef.current.vz = 0;
+      return;
+    }
+
+    if (fxState && fxState.type === 'GOAL') {
+      const goalKey = `${fxState.eventKey ?? ''}-${fxState.team}-${fxState.text || ''}-${fxState.x?.toFixed(2) || 'x'}-${fxState.y?.toFixed(2) || 'y'}`;
+      if (activeGoalShotKeyRef.current !== goalKey) {
+        activeGoalShotKeyRef.current = goalKey;
+        goalShotStartedAtRef.current = now;
+        lastBallImpulseAtRef.current = now;
+
+        const shotStart = mapCoords(
+          typeof fxState.shotFromX === 'number' ? fxState.shotFromX : prevPropsBall.current.x,
+          typeof fxState.shotFromY === 'number' ? fxState.shotFromY : prevPropsBall.current.y
+        );
+        const travelTime = 0.82 + Math.min(0.34, Math.hypot(c.x - shotStart.x, c.z - shotStart.z) * 0.018);
+        const targetGoalHeight = typeof fxState.goalHeight === 'number' ? fxState.goalHeight : 1.2;
+
+        ballPhysicsRef.current.x = shotStart.x;
+        ballPhysicsRef.current.y = 0.28;
+        ballPhysicsRef.current.z = shotStart.z;
+        ballPhysicsRef.current.vx = (c.x - shotStart.x) / travelTime;
+        ballPhysicsRef.current.vz = (c.z - shotStart.z) / travelTime;
+        ballPhysicsRef.current.vy = (targetGoalHeight - ballPhysicsRef.current.y) / travelTime - 0.5 * (-18.5) * travelTime;
+      }
+
+      return;
+    }
+
     prevPropsBall.current = { ...ball };
 
     // When the coordinate changes significantly, trigger a realistic ball-kick projection!
-    const now = performance.now();
     if (dist > 1.2 && now - lastBallImpulseAtRef.current > 550) {
       lastBallImpulseAtRef.current = now;
       // Calculate realistic flight loft duration based on distance
@@ -914,12 +955,14 @@ export default function ThreeDPitch({
       
       let finalOrbitHeight = orbitHeightRef.current;
 
+      const goalShotAge = fxStateVal?.type === 'GOAL' ? performance.now() - goalShotStartedAtRef.current : 0;
+
       if (fxStateVal && fxStateVal.type === 'GOAL') {
-        // High intensity dynamic Zoom Closer targeting the Goal net / Saved / Miss area!
+        // Follow the shot first, then switch to the net close-up.
         targetLookX = b.x;
         targetLookY = b.y;
         targetLookZ = b.z;
-        finalOrbitHeight = 5.8; // Majestic extra close zoom inside the goal net!
+        finalOrbitHeight = goalShotAge < 850 ? orbitHeightRef.current * 0.55 : 5.8;
       } else if (fxStateVal && (fxStateVal.type === 'SAVE' || fxStateVal.type === 'MISS')) {
         targetLookX = b.x;
         targetLookY = b.y + 0.12;
@@ -942,7 +985,7 @@ export default function ThreeDPitch({
       let cZ = Math.sin(orbitAngleRef.current) * finalOrbitHeight + cameraLookAtRef.current.z * 0.45;
       let cY = Math.sin(targetYAngleRef.current) * finalOrbitHeight * 0.85;
 
-      if (fxStateVal && fxStateVal.type === 'GOAL') {
+      if (fxStateVal && fxStateVal.type === 'GOAL' && goalShotAge >= 1050) {
         const isAwayNet = fxStateVal.team === 'home'; // scored on awayGoal (Z = 19.5, ball = 20.25)
         // Position camera dynamically at a flawless low-angle post view (e.g. 1.15 meters off the turf, 16.5m along Z)
         cX = isAwayNet ? -4.5 : 4.5;
@@ -960,47 +1003,82 @@ export default function ThreeDPitch({
         const pGroup = playersGroupRef.current?.getObjectByName(carryId);
         if (pGroup) {
           const isHome = pGroup.userData.team === 'home';
-          const dribbleT = (pGroup.userData.animTime || 0) * 2.2;
-          const sideTouch = Math.sin(dribbleT) * 0.17;
-          const forwardTouch = 0.38 + Math.max(0, Math.sin(dribbleT * 1.4)) * 0.14;
-          const zOffset = isHome ? forwardTouch : -forwardTouch;
-          b.x = pGroup.position.x + sideTouch;
-          b.y = 0.25 + Math.max(0, Math.sin(dribbleT * 1.8)) * 0.06;
-          b.z = pGroup.position.z + zOffset;
-          b.vx = 0;
+          const targetX = pGroup.userData.targetX !== undefined ? pGroup.userData.targetX : pGroup.position.x;
+          const targetZ = pGroup.userData.targetZ !== undefined ? pGroup.userData.targetZ : pGroup.position.z;
+          let dirX = targetX - pGroup.position.x;
+          let dirZ = targetZ - pGroup.position.z;
+          const dirLen = Math.hypot(dirX, dirZ);
+
+          if (dirLen > 0.015) {
+            dirX /= dirLen;
+            dirZ /= dirLen;
+            pGroup.userData.lastDirX = dirX;
+            pGroup.userData.lastDirZ = dirZ;
+          } else {
+            dirX = pGroup.userData.lastDirX ?? 0;
+            dirZ = pGroup.userData.lastDirZ ?? (isHome ? 1 : -1);
+          }
+
+          const dribbleT = (pGroup.userData.animTime || 0) * 2.6;
+          const footSide = Math.sin(dribbleT) >= 0 ? 1 : -1;
+          const touchPulse = Math.pow(Math.max(0, Math.sin(dribbleT * 2.0)), 1.7);
+          const lateralX = dirZ;
+          const lateralZ = -dirX;
+          const forwardTouch = 0.34 + touchPulse * 0.22 + Math.min(0.12, dirLen * 0.35);
+          const sideTouch = footSide * (0.11 + touchPulse * 0.05);
+          const desiredX = pGroup.position.x + dirX * forwardTouch + lateralX * sideTouch;
+          const desiredZ = pGroup.position.z + dirZ * forwardTouch + lateralZ * sideTouch;
+          const nextX = b.x + (desiredX - b.x) * 0.5;
+          const nextZ = b.z + (desiredZ - b.z) * 0.5;
+
+          b.vx = (nextX - b.x) / Math.max(delta, 0.016);
           b.vy = 0;
-          b.vz = 0;
+          b.vz = (nextZ - b.z) / Math.max(delta, 0.016);
+          b.x = nextX;
+          b.y = 0.235 + touchPulse * 0.025;
+          b.z = nextZ;
           isHandledByPossessor = true;
         }
       }
 
       if (!isHandledByPossessor) {
-        // Gravity acceleration dragging down
-        const ballGravity = -18.5;
-        b.vy += ballGravity * delta;
+        const isThrowInSetup = fxStateVal?.type === 'NONE' && typeof fxStateVal.text === 'string' && fxStateVal.text.startsWith('TAÇ');
 
-        // Damped harmonic tracking spring force pulling ball horizontally to its logic target
-        const ballSpring = 14.8;
-        const ballDamp = 5.5;
-        const forceX = (targetVec.x - b.x) * ballSpring - b.vx * ballDamp;
-        const forceZ = (targetVec.z - b.z) * ballSpring - b.vz * ballDamp;
+        if (isThrowInSetup) {
+          b.x += (targetVec.x - b.x) * 0.28;
+          b.z += (targetVec.z - b.z) * 0.28;
+          b.y += (1.68 - b.y) * 0.32;
+          b.vx = 0;
+          b.vy = 0;
+          b.vz = 0;
+        } else {
+          // Gravity acceleration dragging down
+          const ballGravity = -18.5;
+          b.vy += ballGravity * delta;
 
-        b.vx += forceX * delta;
-        b.vz += forceZ * delta;
+          // Damped harmonic tracking spring force pulling ball horizontally to its logic target
+          const ballSpring = 14.8;
+          const ballDamp = 5.5;
+          const forceX = (targetVec.x - b.x) * ballSpring - b.vx * ballDamp;
+          const forceZ = (targetVec.z - b.z) * ballSpring - b.vz * ballDamp;
 
-        b.x += b.vx * delta;
-        b.y += b.vy * delta;
-        b.z += b.vz * delta;
+          b.vx += forceX * delta;
+          b.vz += forceZ * delta;
 
-        // Grass turf boundary limits colliders (ball radius 0.25)
-        if (b.y <= 0.25) {
-          b.y = 0.25;
-          b.vy = -b.vy * 0.62; // elastic bounce restitution
+          b.x += b.vx * delta;
+          b.y += b.vy * delta;
+          b.z += b.vz * delta;
 
-          // Roll friction damping
-          b.vx *= 0.94;
-          b.vz *= 0.94;
-          if (Math.abs(b.vy) < 0.22) b.vy = 0;
+          // Grass turf boundary limits colliders (ball radius 0.25)
+          if (b.y <= 0.25) {
+            b.y = 0.25;
+            b.vy = -b.vy * 0.62; // elastic bounce restitution
+
+            // Roll friction damping
+            b.vx *= 0.94;
+            b.vz *= 0.94;
+            if (Math.abs(b.vy) < 0.22) b.vy = 0;
+          }
         }
       }
 
@@ -1011,23 +1089,23 @@ export default function ThreeDPitch({
         if (b.z >= 19.4) {
           if (b.z >= 20.25) {
             b.z = 20.25;
-            b.vz = -b.vz * 0.05; // zero velocity rebound
-            b.vx *= 0.7;
-            b.vy *= 0.5; // drop down inside net
+            b.vz = -Math.abs(b.vz) * 0.22; // net absorbs, then pushes ball slightly back
+            b.vx *= 0.46;
+            b.vy = Math.min(b.vy * 0.38, -0.18); // lose lift and fall inside net
           }
-          if (b.x > 3.05) { b.x = 3.05; b.vx = -b.vx * 0.1; }
-          if (b.x < -3.05) { b.x = -3.05; b.vx = -b.vx * 0.1; }
+          if (b.x > 3.05) { b.x = 3.05; b.vx = -Math.abs(b.vx) * 0.18; }
+          if (b.x < -3.05) { b.x = -3.05; b.vx = Math.abs(b.vx) * 0.18; }
         }
         // Home Goal Net Check (scoring on homeGoal)
         if (b.z <= -19.4) {
           if (b.z <= -20.25) {
             b.z = -20.25;
-            b.vz = -b.vz * 0.05; // drops down
-            b.vx *= 0.7;
-            b.vy *= 0.5;
+            b.vz = Math.abs(b.vz) * 0.22;
+            b.vx *= 0.46;
+            b.vy = Math.min(b.vy * 0.38, -0.18);
           }
-          if (b.x > 3.05) { b.x = 3.05; b.vx = -b.vx * 0.1; }
-          if (b.x < -3.05) { b.x = -3.05; b.vx = -b.vx * 0.1; }
+          if (b.x > 3.05) { b.x = 3.05; b.vx = -Math.abs(b.vx) * 0.18; }
+          if (b.x < -3.05) { b.x = -3.05; b.vx = Math.abs(b.vx) * 0.18; }
         }
       }
 
@@ -1125,12 +1203,36 @@ export default function ThreeDPitch({
                 }
               }
             } else {
+              if (pGroup.userData.restartAction === 'THROW_IN') {
+                if (leftLeg) {
+                  leftLeg.rotation.x = 0.04;
+                  leftLeg.position.y = 0.42;
+                }
+                if (rightLeg) {
+                  rightLeg.rotation.x = -0.04;
+                  rightLeg.position.y = 0.42;
+                }
+                if (leftArm) {
+                  leftArm.rotation.x = -Math.PI * 0.88;
+                  leftArm.rotation.z = -0.42;
+                }
+                if (rightArm) {
+                  rightArm.rotation.x = -Math.PI * 0.88;
+                  rightArm.rotation.z = 0.42;
+                }
+                if (head) head.rotation.x = -0.18;
+                return;
+              }
+
+              const isCarrier = ballPossessorIdRef.current === pGroup.name;
+              const dribbleKick = isCarrier ? Math.max(0, Math.sin(t * 2.6)) * 0.18 : 0;
+
               if (leftLeg) {
-                leftLeg.rotation.x = Math.sin(t) * strideAmp;
+                leftLeg.rotation.x = Math.sin(t) * strideAmp + dribbleKick;
                 leftLeg.position.y = 0.42 + Math.max(0, Math.sin(t)) * 0.05 * (isMoving ? 1 : 0.2);
               }
               if (rightLeg) {
-                rightLeg.rotation.x = -Math.sin(t) * strideAmp;
+                rightLeg.rotation.x = -Math.sin(t) * strideAmp + (isCarrier ? Math.max(0, -Math.sin(t * 2.6)) * 0.18 : 0);
                 rightLeg.position.y = 0.42 + Math.max(0, -Math.sin(t)) * 0.05 * (isMoving ? 1 : 0.2);
               }
               if (leftArm) {
@@ -1250,17 +1352,26 @@ export default function ThreeDPitch({
         // A. Real player body without arcade base rings.
         const skinColors = [0xf2c9a0, 0xd6a06f, 0x8d5524, 0xffdbac];
         const randomSkin = skinColors[player.name.charCodeAt(0) % skinColors.length];
-        const headGeo = new THREE.SphereGeometry(0.2, 12, 12);
+        const headGeo = new THREE.SphereGeometry(0.18, 16, 16);
         const headMat = new THREE.MeshStandardMaterial({
           color: randomSkin,
           roughness: 0.62,
           metalness: 0.05
         });
         const headMesh = new THREE.Mesh(headGeo, headMat);
-        headMesh.position.set(0, 1.25, 0);
+        headMesh.position.set(0, 1.32, 0);
         headMesh.name = 'head';
         headMesh.castShadow = true;
         pGroup.add(headMesh);
+
+        const hairColors = [0x111827, 0x3f2a1d, 0x78350f, 0xd6d3d1];
+        const randomHair = hairColors[player.name.charCodeAt(1) % hairColors.length];
+        const hairMesh = new THREE.Mesh(
+          new THREE.SphereGeometry(0.183, 16, 8, 0, Math.PI * 2, 0, Math.PI * 0.48),
+          new THREE.MeshStandardMaterial({ color: randomHair, roughness: 0.82 })
+        );
+        hairMesh.position.set(0, 0.035, 0);
+        headMesh.add(hairMesh);
 
         // Subtle facial details for close camera angles.
         const eyeGeo = new THREE.SphereGeometry(0.025, 6, 6);
@@ -1279,57 +1390,62 @@ export default function ThreeDPitch({
         faceMouth.position.set(0, -0.08, 0.17);
         headMesh.add(faceMouth);
 
-        // B. Slim jersey torso with distinct front and back materials.
-        // This ensures names and shirt numbers are highly visible in pristine detail!
-        const torsoGeo = new THREE.BoxGeometry(0.46, 0.68, 0.26);
-        const sideMaterial = new THREE.MeshStandardMaterial({
-          color: isGK ? 0xf59e0b : (isHome ? 0xda020e : 0x0284c7),
-          roughness: 0.5
-        });
-
-        const frontTex = createFrontJerseyTexture(player, isHome);
-        const backTex = createBackJerseyTexture(player, isHome);
-
-        const frontMaterial = new THREE.MeshStandardMaterial({ map: frontTex, roughness: 0.5 });
-        const backMaterial = new THREE.MeshStandardMaterial({ map: backTex, roughness: 0.5 });
-        const topMaterial = new THREE.MeshStandardMaterial({ color: isGK ? 0xba1d1d : 0xffffff, roughness: 0.4 });
-
-        // Box faces materials mapping in ThreeJS:
-        // [right (+x), left (-x), top (+y), bottom (-y), front (+z), back (-z)]
-        const torsoMaterials = [
-          sideMaterial,  // Right side sleeve overlap
-          sideMaterial,  // Left side sleeve
-          topMaterial,   // Shoulder pads
-          sideMaterial,  // Bottom waist
-          frontMaterial, // FRONT CHEST (Sponsor Brand Logo + Crest)
-          backMaterial   // BACK PANEL (Surname text + Jersey Number)
-        ];
-
-        const torsoMesh = new THREE.Mesh(torsoGeo, torsoMaterials);
-        torsoMesh.position.set(0, 0.82, 0);
+        // B. Tapered jersey body, closer to a football-game player silhouette than a block.
+        const jerseyColorHex = isGK ? 0xf59e0b : (isHome ? 0xda020e : 0x0284c7);
+        const jerseyMat = new THREE.MeshStandardMaterial({ color: jerseyColorHex, roughness: 0.46, metalness: 0.03 });
+        const torsoMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.18, 0.68, 14), jerseyMat);
+        torsoMesh.scale.z = 0.72;
+        torsoMesh.position.set(0, 0.86, 0);
         torsoMesh.name = 'torso';
         torsoMesh.castShadow = true;
         torsoMesh.receiveShadow = true;
         pGroup.add(torsoMesh);
 
+        const numberCanvas = document.createElement('canvas');
+        numberCanvas.width = 96;
+        numberCanvas.height = 96;
+        const numberCtx = numberCanvas.getContext('2d');
+        if (numberCtx) {
+          numberCtx.fillStyle = '#ffffff';
+          numberCtx.textAlign = 'center';
+          numberCtx.textBaseline = 'middle';
+          numberCtx.font = '900 56px Arial';
+          numberCtx.fillText(String(player.number), 48, 52);
+        }
+        const numberTex = new THREE.CanvasTexture(numberCanvas);
+        const numberMat = new THREE.MeshBasicMaterial({ map: numberTex, transparent: true, depthWrite: false });
+        const chestNumber = new THREE.Mesh(new THREE.PlaneGeometry(0.26, 0.26), numberMat);
+        chestNumber.name = 'chestNumber';
+        chestNumber.position.set(0, 0.88, 0.2);
+        torsoMesh.add(chestNumber);
+
+        const shoulderMat = new THREE.MeshStandardMaterial({ color: isGK ? 0xfbbf24 : (isHome ? 0xffffff : 0xe0f2fe), roughness: 0.42 });
+        const shoulders = new THREE.Mesh(new THREE.CapsuleGeometry(0.055, 0.5, 4, 8), shoulderMat);
+        shoulders.name = 'shoulders';
+        shoulders.rotation.z = Math.PI / 2;
+        shoulders.position.set(0, 1.18, 0);
+        shoulders.castShadow = true;
+        pGroup.add(shoulders);
+
         // Shorts mesh: rectangular football shorts, not a circular stand.
         const shortsColor = isHome ? 0xffffff : 0x1e293b;
         const shortsBar = new THREE.Mesh(
-          new THREE.BoxGeometry(0.42, 0.22, 0.26),
+          new THREE.CylinderGeometry(0.19, 0.22, 0.22, 12),
           new THREE.MeshStandardMaterial({ color: shortsColor, roughness: 0.6 })
         );
+        shortsBar.scale.z = 0.72;
         shortsBar.position.set(0, 0.46, 0);
         shortsBar.castShadow = true;
         pGroup.add(shortsBar);
 
         // C. Limb cylinders with real boots planted on the pitch.
-        const thighGeo = new THREE.CylinderGeometry(0.07, 0.06, 0.4, 10);
+        const thighGeo = new THREE.CylinderGeometry(0.062, 0.054, 0.42, 10);
         const skinMat = new THREE.MeshStandardMaterial({ color: randomSkin, roughness: 0.62 });
         const bootMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.54 });
 
         const leftLeg = new THREE.Group();
         leftLeg.name = 'leftLeg';
-        leftLeg.position.set(-0.14, 0.42, 0);
+        leftLeg.position.set(-0.115, 0.43, 0);
         
         const leftThigh = new THREE.Mesh(thighGeo, skinMat);
         leftThigh.position.y = -0.16;
@@ -1339,14 +1455,14 @@ export default function ThreeDPitch({
         // Socks boots
         const sockColor = isHome ? 0xda020e : 0xffffff;
         const leftSock = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.082, 0.075, 0.18, 8),
+          new THREE.CylinderGeometry(0.064, 0.058, 0.2, 10),
           new THREE.MeshStandardMaterial({ color: sockColor, roughness: 0.7 })
         );
         leftSock.position.set(0, -0.24, 0);
         leftSock.castShadow = true;
         leftLeg.add(leftSock);
 
-        const leftBoot = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.07, 0.28), bootMat);
+        const leftBoot = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.055, 0.32), bootMat);
         leftBoot.name = 'leftBoot';
         leftBoot.position.set(0, -0.36, 0.08);
         leftBoot.castShadow = true;
@@ -1357,7 +1473,7 @@ export default function ThreeDPitch({
         // Leg Right group
         const rightLeg = new THREE.Group();
         rightLeg.name = 'rightLeg';
-        rightLeg.position.set(0.14, 0.42, 0);
+        rightLeg.position.set(0.115, 0.43, 0);
         
         const rightThigh = new THREE.Mesh(thighGeo, skinMat);
         rightThigh.position.y = -0.16;
@@ -1365,14 +1481,14 @@ export default function ThreeDPitch({
         rightLeg.add(rightThigh);
 
         const rightSock = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.082, 0.075, 0.18, 8),
+          new THREE.CylinderGeometry(0.064, 0.058, 0.2, 10),
           new THREE.MeshStandardMaterial({ color: sockColor, roughness: 0.7 })
         );
         rightSock.position.set(0, -0.24, 0);
         rightSock.castShadow = true;
         rightLeg.add(rightSock);
 
-        const rightBoot = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.07, 0.28), bootMat);
+        const rightBoot = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.055, 0.32), bootMat);
         rightBoot.name = 'rightBoot';
         rightBoot.position.set(0, -0.36, 0.08);
         rightBoot.castShadow = true;
@@ -1381,16 +1497,15 @@ export default function ThreeDPitch({
         pGroup.add(rightLeg);
 
         // Sleeve arms
-        const armGeo = new THREE.CylinderGeometry(0.05, 0.045, 0.4, 8);
-        const jerseyColorHex = isGK ? 0xf59e0b : (isHome ? 0xda020e : 0x0284c7);
+        const armGeo = new THREE.CylinderGeometry(0.04, 0.034, 0.42, 10);
         const sleeveMat = new THREE.MeshStandardMaterial({ color: jerseyColorHex, roughness: 0.5 });
 
         // Left Arm
         const leftArm = new THREE.Group();
         leftArm.name = 'leftArm';
-        leftArm.position.set(-0.35, 1.0, 0);
+        leftArm.position.set(-0.29, 1.05, 0);
 
-        const sleeveL = new THREE.Mesh(new THREE.CylinderGeometry(0.065, 0.055, 0.15, 8), sleeveMat);
+        const sleeveL = new THREE.Mesh(new THREE.CylinderGeometry(0.052, 0.044, 0.16, 10), sleeveMat);
         sleeveL.position.y = -0.06;
         leftArm.add(sleeveL);
 
@@ -1402,9 +1517,9 @@ export default function ThreeDPitch({
         // Right Arm
         const rightArm = new THREE.Group();
         rightArm.name = 'rightArm';
-        rightArm.position.set(0.35, 1.0, 0);
+        rightArm.position.set(0.29, 1.05, 0);
 
-        const sleeveR = new THREE.Mesh(new THREE.CylinderGeometry(0.065, 0.055, 0.15, 8), sleeveMat);
+        const sleeveR = new THREE.Mesh(new THREE.CylinderGeometry(0.052, 0.044, 0.16, 10), sleeveMat);
         sleeveR.position.y = -0.06;
         rightArm.add(sleeveR);
 
@@ -1420,6 +1535,7 @@ export default function ThreeDPitch({
         pGroup.userData.position = player.position;
         pGroup.userData.pNumber = player.number;
         pGroup.userData.name = player.name;
+        pGroup.userData.restartAction = player.restartAction;
         playersGroup.add(pGroup);
       } else {
         // Set targets to slide smoothly inside the requestAnimationFrame loop
@@ -1429,6 +1545,7 @@ export default function ThreeDPitch({
         pGroup.userData.position = player.position;
         pGroup.userData.pNumber = player.number;
         pGroup.userData.name = player.name;
+        pGroup.userData.restartAction = player.restartAction;
       }
     });
 

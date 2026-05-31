@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Player, Tactics, Club, MatchEvent } from '../types';
+import { Player, Tactics, Club, MatchEvent, MatchEventType, MatchState } from '../types';
 import { Play, Pause, Award, Activity, AlertCircle, RefreshCw, Sparkles, AlertTriangle, Tv, Grid3X3, Trophy, CheckCircle2, Eye, Volume2, VolumeX } from 'lucide-react';
 import { soundEngine } from '../utils/soundEngine';
+import { generateMatchCommentary, getMatchEventLabel } from '../utils/matchEventCatalog';
 import ThreeDPitch from './ThreeDPitch';
 import BroadcastBanner from './BroadcastBanner';
 
@@ -80,6 +81,7 @@ class SeededRandom {
 }
 
 type TeamSide = 'home' | 'away';
+type GoalKind = 'OPEN_PLAY' | 'HEADER' | 'PENALTY' | 'FREE_KICK' | 'OWN_GOAL';
 
 interface LivePitchPlayer {
   id: string;
@@ -98,6 +100,7 @@ interface LivePitchPlayer {
   number: number;
   actionCooldown: number;
   lastTouchTick: number;
+  restartAction?: 'THROW_IN';
 }
 
 interface LiveBallState {
@@ -123,6 +126,8 @@ interface PlannedGoal {
   scorerId?: string;
   played: boolean;
   y: number;
+  height: number;
+  kind: GoalKind;
 }
 
 declare global {
@@ -214,10 +219,11 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
   const [ballTarget, setBallTarget] = useState({ x: 50, y: 50 });
   const [referee, setReferee] = useState({ x: 50, y: 50 });
   const [passingLines, setPassingLines] = useState<Array<{ fromX: number; fromY: number; toX: number; toY: number; time: number }>>([]);
-  const [fxState, setFxState] = useState<{ type: 'GOAL' | 'SAVE' | 'MISS' | 'CARD' | 'RED_CARD' | 'FOUL' | 'INJURY' | 'NONE'; text?: string; team?: 'home' | 'away'; x?: number; y?: number } | null>(null);
+  const [fxState, setFxState] = useState<{ type: 'GOAL' | 'SAVE' | 'MISS' | 'CARD' | 'RED_CARD' | 'FOUL' | 'INJURY' | 'NONE'; text?: string; team?: 'home' | 'away'; x?: number; y?: number; shotFromX?: number; shotFromY?: number; goalHeight?: number; eventKey?: number } | null>(null);
 
   const scorersRef = useRef<string[]>([]);
   const matchEventsRef = useRef<MatchEvent[]>([]);
+  const eventGateRef = useRef<Record<string, number>>({});
 
   // Real-time gameplay state-machine refs
   const playPhaseRef = useRef<'KICKOFF' | 'MIDFIELD' | 'HOME_ATTACK' | 'AWAY_ATTACK' | 'SHOT_FLIGHT' | 'CELEBRATION' | 'FOUL_PAUSE'>('KICKOFF');
@@ -230,6 +236,8 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
   const intendedReceiverIdRef = useRef<string | null>(null);
   const passerIdRef = useRef<string | null>(null);
   const passTicksRef = useRef<number>(0);
+  const lastPassTypeRef = useRef<MatchEventType | null>(null);
+  const lastPasserNameRef = useRef<string | null>(null);
   const pendingGoalRef = useRef<{
     home: boolean;
     scorerName: string;
@@ -247,8 +255,33 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     minute: number;
   } | null>(null);
 
+  const pendingRestartRef = useRef<{
+    type: MatchEventType;
+    team: TeamSide;
+    takerName: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const pendingBallActionRef = useRef<{
+    kind: 'PASS' | 'SHOT';
+    kickerId: string;
+    team: TeamSide;
+    dueTick: number;
+    targetX: number;
+    targetY: number;
+    power: number;
+    loft: number;
+    passType?: MatchEventType;
+    receiverId?: string;
+    receiverName?: string;
+    eventLabel: string;
+    eventDetail: string;
+    minute: number;
+  } | null>(null);
+
   const liveTickRef = useRef(0);
   const minuteRef = useRef(minute);
+  const secondRef = useRef(second);
   const debugRef = useRef({
     lastSnapshot: '',
     sameSnapshotTicks: 0,
@@ -271,7 +304,426 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     totalPossTicks: 0,
     lastShotTick: -999
   });
+  const matchStateRef = useRef<MatchState>({
+    possessionTeamId: null,
+    ballZone: 'MIDFIELD',
+    ballOwnerPlayerId: null,
+    matchTempo: 'NORMAL',
+    lastEventTypes: [],
+    lastEventPlayerIds: [],
+    repeatedChainCounter: {},
+    playerCooldowns: {},
+    teamCooldowns: {},
+    chainCooldowns: {}
+  });
   const matchPlanRef = useRef<{ seed: number; goals: PlannedGoal[] }>({ seed: matchSeed, goals: [] });
+
+  const getClubBySide = (team: TeamSide) => team === 'home' ? homeClub : awayClub;
+  const getOppositeTeam = (team: TeamSide): TeamSide => team === 'home' ? 'away' : 'home';
+  const getRosterBySide = (team: TeamSide) => team === 'home' ? homeSquad : awaySquad;
+  const getPlayerCooldownKey = (team: TeamSide, playerName: string) =>
+    getRosterBySide(team).find(player => player.name === playerName)?.id || playerName || 'unknown';
+  const getBallZone = (x: number, y: number): MatchState['ballZone'] => {
+    if (y < 22) return 'LEFT_WING';
+    if (y > 78) return 'RIGHT_WING';
+    if (x < 18) return 'HOME_DEFENSE';
+    if (x < 42) return 'HOME_HALF';
+    if (x > 82) return 'AWAY_DEFENSE';
+    if (x > 58) return 'AWAY_HALF';
+    return 'MIDFIELD';
+  };
+  const resetMatchFlowState = () => {
+    matchStateRef.current = {
+      possessionTeamId: null,
+      ballZone: 'MIDFIELD',
+      ballOwnerPlayerId: null,
+      matchTempo: 'NORMAL',
+      lastEventTypes: [],
+      lastEventPlayerIds: [],
+      repeatedChainCounter: {},
+      playerCooldowns: {},
+      teamCooldowns: {},
+      chainCooldowns: {}
+    };
+  };
+  const syncMatchState = (team: TeamSide | null, ownerId: string | null, x = ballSimRef.current.x, y = ballSimRef.current.y) => {
+    matchStateRef.current.possessionTeamId = team ? getClubBySide(team).id : null;
+    matchStateRef.current.ballOwnerPlayerId = ownerId;
+    matchStateRef.current.ballZone = getBallZone(x, y);
+    matchStateRef.current.matchTempo = Math.abs(x - 50) > 28 || y < 18 || y > 82 ? 'HIGH' : Math.abs(x - 50) < 12 ? 'NORMAL' : 'LOW';
+  };
+  const appendMatchLog = (line: string) => {
+    setLogs(prev => [...prev, line].slice(-180));
+  };
+
+  const pushMatchEvent = (
+    type: MatchEventType,
+    team: TeamSide,
+    playerName: string,
+    detail: string,
+    label: string,
+    options: { minute?: number; minGapTicks?: number; sound?: boolean; log?: boolean; force?: boolean; outcome?: MatchEvent['outcome'] } = {}
+  ) => {
+    const nowTick = liveTickRef.current;
+    const gateKey = `${type}:${team}:${playerName}`;
+    const eventMinute = Math.max(1, options.minute ?? minuteRef.current);
+    const club = getClubBySide(team);
+    const state = matchStateRef.current;
+    const playerKey = getPlayerCooldownKey(team, playerName);
+    const teamKey = club.id;
+    const playerCooldown = state.playerCooldowns[playerKey]?.[type] || 0;
+    const teamCooldown = state.teamCooldowns[teamKey]?.[type] || 0;
+    const prevType = state.lastEventTypes[state.lastEventTypes.length - 1];
+    const chainKey = prevType ? `${prevType}->${type}` : '';
+    const chainCooldown = chainKey ? state.chainCooldowns[chainKey] || 0 : 0;
+    const lastTwoSamePlayerEvents = state.lastEventTypes.slice(-2).every(eventType => eventType === type) &&
+      state.lastEventPlayerIds.slice(-2).every(playerId => playerId === playerKey);
+
+    if (!options.force) {
+      if (options.minGapTicks && eventGateRef.current[gateKey] && nowTick - eventGateRef.current[gateKey] < options.minGapTicks) return false;
+      if (playerCooldown > nowTick || teamCooldown > nowTick || chainCooldown > nowTick || lastTwoSamePlayerEvents) return false;
+    }
+
+    eventGateRef.current[gateKey] = nowTick;
+    const eventLabel = label || getMatchEventLabel(type);
+    const commentary = generateMatchCommentary(type, playerName, detail);
+    if (!state.playerCooldowns[playerKey]) state.playerCooldowns[playerKey] = {};
+    if (!state.teamCooldowns[teamKey]) state.teamCooldowns[teamKey] = {};
+    state.playerCooldowns[playerKey][type] = nowTick + 95;
+    state.teamCooldowns[teamKey][type] = nowTick + 45;
+    if (chainKey) {
+      state.repeatedChainCounter[chainKey] = (state.repeatedChainCounter[chainKey] || 0) + 1;
+      if (state.repeatedChainCounter[chainKey] >= 2) state.chainCooldowns[chainKey] = nowTick + 520;
+    }
+    state.lastEventTypes = [...state.lastEventTypes, type].slice(-10);
+    state.lastEventPlayerIds = [...state.lastEventPlayerIds, playerKey].slice(-10);
+    syncMatchState(team, ballSimRef.current.ownerId, ballSimRef.current.x, ballSimRef.current.y);
+
+    matchEventsRef.current.push({
+      id: `${eventMinute}-${nowTick}-${type}-${matchEventsRef.current.length}`,
+      minute: eventMinute,
+      second: secondRef.current,
+      type,
+      teamId: club.id,
+      teamSide: team,
+      playerName,
+      detail,
+      commentary,
+      x: ballSimRef.current.x,
+      y: ballSimRef.current.y,
+      chainId: `${eventMinute}-${Math.floor(nowTick / 20)}-${team}`,
+      outcome: options.outcome || 'NEUTRAL',
+      metadata: {
+        ballZone: state.ballZone,
+        possessionTeamId: state.possessionTeamId,
+        matchTempo: state.matchTempo,
+        repeatedChainCount: chainKey ? state.repeatedChainCounter[chainKey] || 0 : 0
+      }
+    });
+    if (options.log !== false) appendMatchLog(`${eventMinute}' [${eventLabel}] - ${commentary}`);
+    if (options.sound) soundEngine.playCommentaryTick();
+    return true;
+  };
+
+  const pickEventPlayer = (team: TeamSide, positions?: Player['position'][]) => {
+    const livePool = pitchPlayersRef.current.filter(p =>
+      p.team === team &&
+      (!positions || positions.includes(p.position as Player['position']))
+    );
+    if (livePool.length > 0) return rngRef.current.choice(livePool);
+
+    const roster = getRosterBySide(team).filter(p =>
+      p.isStarting &&
+      (!positions || positions.includes(p.position))
+    );
+    const fallback = getRosterBySide(team).find(p => p.isStarting) || getRosterBySide(team)[0];
+    const player = roster.length > 0 ? rngRef.current.choice(roster) : fallback;
+    if (!player) return { name: 'Bilinmeyen Oyuncu', team, position: 'MID', rating: 60 };
+    return { name: player.name, team, position: player.position, rating: player.rating };
+  };
+
+  const chooseSetPieceTaker = (team: TeamSide, type: 'THROW_IN' | 'CORNER' | 'FREE_KICK' | 'INDIRECT_FREE_KICK' | 'PENALTY' | 'GOAL_KICK') => {
+    const starters = getRosterBySide(team).filter(p => p.isStarting);
+    const outfield = starters.filter(p => p.position !== 'GK');
+    const fallback = outfield[0] || starters[0] || getRosterBySide(team)[0];
+    if (!fallback) return 'Bilinmeyen Oyuncu';
+
+    if (type === 'GOAL_KICK') {
+      return (starters.find(p => p.position === 'GK') || fallback).name;
+    }
+
+    if (type === 'PENALTY') {
+      const taker = [...outfield].sort((a, b) => {
+        const aScore = (a.isPenaltyTaker ? 1000 : 0) + a.shooting * 1.8 + a.morale * 0.35 + a.form * 4 + a.rating;
+        const bScore = (b.isPenaltyTaker ? 1000 : 0) + b.shooting * 1.8 + b.morale * 0.35 + b.form * 4 + b.rating;
+        return bScore - aScore;
+      })[0];
+      return (taker || fallback).name;
+    }
+
+    if (type === 'THROW_IN') {
+      const taker = [...outfield].sort((a, b) => {
+        const aWide = a.position === 'DEF' ? 24 : a.position === 'MID' ? 14 : 0;
+        const bWide = b.position === 'DEF' ? 24 : b.position === 'MID' ? 14 : 0;
+        return (bWide + b.passing * 0.8 + b.physical * 0.45 + b.rating * 0.25) -
+          (aWide + a.passing * 0.8 + a.physical * 0.45 + a.rating * 0.25);
+      })[0];
+      return (taker || fallback).name;
+    }
+
+    const taker = [...outfield].sort((a, b) => {
+      const aDeadBall = a.passing * 1.25 + a.shooting * (type === 'FREE_KICK' ? 0.9 : 0.35) + a.rating * 0.4 + (a.position === 'MID' ? 12 : 0);
+      const bDeadBall = b.passing * 1.25 + b.shooting * (type === 'FREE_KICK' ? 0.9 : 0.35) + b.rating * 0.4 + (b.position === 'MID' ? 12 : 0);
+      return bDeadBall - aDeadBall;
+    })[0];
+    return (taker || fallback).name;
+  };
+
+  const pushSetPieceSequence = (
+    restartType: MatchEventType,
+    team: TeamSide,
+    takerName: string,
+    detail: string,
+    label: string
+  ) => {
+    const minute = Math.max(1, minuteRef.current);
+    pushMatchEvent('STOPPAGE', team, 'Hakem', 'Oyun duran top kararı için durdu.', 'Oyun Durdu', { minute, force: true });
+
+    if (restartType === 'THROW_IN' || restartType === 'THROW_IN_AWARDED') {
+      pushMatchEvent('BALL_OUT', team, 'Top', 'Top taç çizgisinden oyun alanını terk etti.', 'Top Dışarıda', { minute, force: true });
+      pushMatchEvent('THROW_IN_AWARDED', team, takerName, detail, label, { minute, force: true });
+      pushMatchEvent('PLAYER_TAKES_BALL_FOR_THROW', team, takerName, `${takerName} taç atışı için topu eline aldı.`, 'Taç Hazırlığı', { minute, force: true });
+      if (rngRef.current.next() < 0.18) {
+        pushMatchEvent('LONG_THROW', team, takerName, `${takerName} ceza sahasına uzun taç gönderdi.`, 'Uzun Taç', { minute, force: true });
+      }
+      pushMatchEvent('THROW_IN_TAKEN', team, takerName, `${takerName} taç atışını kullandı.`, 'Taç Kullanıldı', { minute, force: true });
+      pushMatchEvent('BALL_IN_PLAY', team, takerName, 'Top yeniden oyunda.', 'Top Oyunda', { minute, force: true });
+      return;
+    }
+
+    if (restartType === 'CORNER' || restartType === 'CORNER_AWARDED') {
+      pushMatchEvent('BALL_OUT', team, 'Top', 'Top kale çizgisinden oyun alanını terk etti.', 'Top Dışarıda', { minute, force: true });
+      pushMatchEvent('CORNER_AWARDED', team, takerName, detail, label, { minute, force: true });
+      pushMatchEvent('PLAYER_PLACES_BALL_CORNER', team, takerName, `${takerName} topu korner yayına yerleştirdi.`, 'Korner Hazırlığı', { minute, force: true });
+      if (rngRef.current.next() < 0.22) {
+        pushMatchEvent('SHORT_CORNER', team, takerName, `${takerName} kısa korner organizasyonunu başlattı.`, 'Kısa Korner', { minute, force: true });
+      }
+      pushMatchEvent('CORNER_TAKEN', team, takerName, `${takerName} korneri kullandı.`, 'Korner Kullanıldı', { minute, force: true });
+      pushMatchEvent('BALL_IN_PLAY', team, takerName, 'Top yeniden oyunda.', 'Top Oyunda', { minute, force: true });
+      return;
+    }
+
+    if (restartType === 'GOAL_KICK' || restartType === 'GOAL_KICK_AWARDED') {
+      const retained = rngRef.current.next() < 0.58;
+      const contestTeam = retained ? team : getOppositeTeam(team);
+      const contestPlayer = pickEventPlayer(contestTeam, ['MID', 'DEF']);
+      pushMatchEvent('BALL_OUT', team, 'Top', 'Top auta çıktı.', 'Top Dışarıda', { minute, force: true });
+      pushMatchEvent('GOAL_KICK_AWARDED', team, takerName, 'Kale vuruşu kararı verildi.', label, { minute, force: true });
+      pushMatchEvent('GOALKEEPER_PLACES_BALL', team, takerName, `${takerName} topu kale vuruşu için yerine koydu.`, 'Kale Vuruşu Hazırlığı', { minute, force: true });
+      pushMatchEvent('GOAL_KICK_TAKEN', team, takerName, `${takerName} uzun oynadı.`, 'Kale Vuruşu Kullanıldı', { minute, force: true, outcome: 'SUCCESS' });
+      pushMatchEvent('BALL_IN_PLAY', team, takerName, 'Top yeniden oyunda.', 'Top Oyunda', { minute, force: true });
+      pushMatchEvent(
+        rngRef.current.next() < 0.72 ? 'AERIAL_DUEL' : 'PASS',
+        contestTeam,
+        contestPlayer.name,
+        retained
+          ? `Orta sahadaki mücadeleyi ${getClubBySide(team).shortName} kazandı.`
+          : `Orta sahadaki hava topunu ${getClubBySide(contestTeam).shortName} kazandı.`,
+        retained ? 'İkinci Top' : 'Hava Topu',
+        { minute, force: true, outcome: retained ? 'SUCCESS' : 'NEUTRAL' }
+      );
+      pushMatchEvent(
+        retained ? 'POSSESSION_RETAINED' : 'POSSESSION_CHANGE',
+        contestTeam,
+        contestPlayer.name,
+        retained
+          ? `${getClubBySide(team).shortName} kale vuruşu sonrası topu korudu.`
+          : `${getClubBySide(contestTeam).shortName} kale vuruşu sonrası topu kazandı.`,
+        retained ? 'Top Korundu' : 'Top El Değiştirdi',
+        { minute, force: true, outcome: retained ? 'SUCCESS' : 'NEUTRAL' }
+      );
+      syncMatchState(contestTeam, null, team === 'home' ? 42 : 58, 50);
+      return;
+    }
+
+    if (restartType === 'FREE_KICK' || restartType === 'INDIRECT_FREE_KICK' || restartType === 'FREE_KICK_AWARDED') {
+      pushMatchEvent('FREE_KICK_AWARDED', team, takerName, detail, label, { minute, force: true });
+      pushMatchEvent('PLAYER_STANDS_OVER_FREE_KICK', team, takerName, `${takerName} serbest vuruş için topun başına geçti.`, 'Frikik Hazırlığı', { minute, force: true });
+      pushMatchEvent('FREE_KICK_TAKEN', team, takerName, `${takerName} serbest vuruşu kullandı.`, 'Frikik Kullanıldı', { minute, force: true });
+      pushMatchEvent('BALL_IN_PLAY', team, takerName, 'Top yeniden oyunda.', 'Top Oyunda', { minute, force: true });
+      return;
+    }
+
+    if (restartType === 'PENALTY' || restartType === 'PENALTY_AWARDED') {
+      pushMatchEvent('PENALTY_AWARDED', team, takerName, detail, label, { minute, force: true });
+      pushMatchEvent('PLAYER_STANDS_OVER_PENALTY', team, takerName, `${takerName} penaltı için topun başına geçti.`, 'Penaltı Hazırlığı', { minute, force: true });
+      pushMatchEvent('PENALTY_TAKEN', team, takerName, `${takerName} penaltıyı kullandı.`, 'Penaltı Kullanıldı', { minute, force: true });
+      pushMatchEvent('BALL_IN_PLAY', team, takerName, 'Top yeniden oyunda.', 'Top Oyunda', { minute, force: true });
+      return;
+    }
+
+    pushMatchEvent(restartType, team, takerName, detail, label, { minute, force: true });
+  };
+
+  const emitAmbientFootballEvent = (currMin: number) => {
+    const rng = rngRef.current;
+    const attackingTeam: TeamSide = rng.next() < possession / 100 ? 'home' : 'away';
+    const defendingTeam = getOppositeTeam(attackingTeam);
+    const attackClub = getClubBySide(attackingTeam);
+    const defenseClub = getClubBySide(defendingTeam);
+    const attacker = pickEventPlayer(attackingTeam, ['ATT', 'MID']);
+    const defender = pickEventPlayer(defendingTeam, ['DEF', 'MID']);
+    const keeper = pickEventPlayer(defendingTeam, ['GK']);
+    const teammate = pickEventPlayer(attackingTeam, ['ATT', 'MID', 'DEF']);
+    const pressureStyle = getClubBySide(attackingTeam).shortName;
+
+    const regularEvents: Array<{
+      type: MatchEventType;
+      team: TeamSide;
+      actor: string;
+      label: string;
+      detail: string;
+      weight: number;
+    }> = [
+      { type: 'PASS', team: attackingTeam, actor: attacker.name, label: 'Pas', detail: `${attacker.name}, ${teammate.name} ile kısa pas bağlantısı kurdu.`, weight: 8 },
+      { type: 'PASS_FAILED', team: attackingTeam, actor: attacker.name, label: 'Başarısız Pas', detail: `${attacker.name} pasın şiddetini ayarlayamadı, top rakibe geçti.`, weight: 4 },
+      { type: 'KEY_PASS', team: attackingTeam, actor: attacker.name, label: 'Anahtar Pas', detail: `${attacker.name} savunma arasına tehlikeli bir anahtar pas bıraktı.`, weight: 3 },
+      { type: 'THROUGH_BALL', team: attackingTeam, actor: attacker.name, label: 'Ara Pası', detail: `${attacker.name} savunma arkasına koşu yapan arkadaşını ara pasıyla aradı.`, weight: 3 },
+      { type: 'CROSS', team: attackingTeam, actor: attacker.name, label: 'Orta', detail: `${attacker.name} çizgiye indi ve ceza sahasına orta gönderdi.`, weight: 4 },
+      { type: 'TURNOVER', team: attackingTeam, actor: attacker.name, label: 'Top Kaybı', detail: `${attacker.name} baskı altında topu ayağından fazla açtı.`, weight: 4 },
+      { type: 'BALL_RECOVERY', team: defendingTeam, actor: defender.name, label: 'Top Kapma', detail: `${defender.name} ikinci topu topladı ve ${defenseClub.shortName} yeniden yerleşti.`, weight: 4 },
+      { type: 'PRESSURE', team: defendingTeam, actor: defender.name, label: 'Pres', detail: `${defender.name} top taşıyan oyuncuya agresif pres yaptı.`, weight: 4 },
+      { type: 'PRESS_RECOVERY', team: defendingTeam, actor: defender.name, label: 'Pres Kazancı', detail: `${defender.name} baskı sonucunda topu takımına kazandırdı.`, weight: 3 },
+      { type: 'DRIBBLE', team: attackingTeam, actor: attacker.name, label: 'Dripling', detail: `${attacker.name} topu ayağına aldı ve rakip yarı alanda driplinge kalktı.`, weight: 5 },
+      { type: 'DRIBBLE_SUCCESS', team: attackingTeam, actor: attacker.name, label: 'Başarılı Dripling', detail: `${attacker.name} bire birde rakibini eksiltti.`, weight: 3 },
+      { type: 'DRIBBLE_FAILED', team: attackingTeam, actor: attacker.name, label: 'Başarısız Dripling', detail: `${attacker.name} çalım denedi ama ${defender.name} geçit vermedi.`, weight: 3 },
+      { type: 'TACKLE', team: defendingTeam, actor: defender.name, label: 'Müdahale', detail: `${defender.name} zamanlaması iyi bir müdahaleyle atağı yavaşlattı.`, weight: 4 },
+      { type: 'SLIDE_TACKLE', team: defendingTeam, actor: defender.name, label: 'Kayarak Müdahale', detail: `${defender.name} kayarak müdahaleyle topu çizgiye doğru gönderdi.`, weight: 2 },
+      { type: 'BLOCK', team: defendingTeam, actor: defender.name, label: 'Blok', detail: `${defender.name} ceza sahası girişindeki pas kanalını blokladı.`, weight: 3 },
+      { type: 'SHOT_BLOCK', team: defendingTeam, actor: defender.name, label: 'Şut Engelleme', detail: `${defender.name} vücudunu siper ederek şutu engelledi.`, weight: 2 },
+      { type: 'INTERCEPTION', team: defendingTeam, actor: defender.name, label: 'Araya Girme', detail: `${defender.name} pas arasına girdi ve tehlikeyi başlamadan bitirdi.`, weight: 4 },
+      { type: 'CLEARANCE', team: defendingTeam, actor: defender.name, label: 'Uzaklaştırma', detail: `${defender.name} topu gelişine uzaklaştırdı.`, weight: 3 },
+      { type: 'LAST_MAN_TACKLE', team: defendingTeam, actor: defender.name, label: 'Son Adam', detail: `${defender.name} son adam olarak kritik bir müdahale yaptı.`, weight: 1 },
+      { type: 'GOAL_LINE_CLEARANCE', team: defendingTeam, actor: defender.name, label: 'Çizgiden Çıkarma', detail: `${defender.name} kaleye giden topu çizgiden çıkardı.`, weight: 1 },
+      { type: 'SAVE', team: defendingTeam, actor: keeper.name, label: 'Kurtarış', detail: `${keeper.name} gelen şutu iki hamlede kontrol etti.`, weight: 3 },
+      { type: 'REFLEX_SAVE', team: defendingTeam, actor: keeper.name, label: 'Refleks', detail: `${keeper.name} yakın mesafede refleks kurtarışı yaptı.`, weight: 2 },
+      { type: 'KEEPER_PUNCH', team: defendingTeam, actor: keeper.name, label: 'Yumruklama', detail: `${keeper.name} ortayı yumruklayarak ceza sahasından uzaklaştırdı.`, weight: 2 },
+      { type: 'KEEPER_CATCH', team: defendingTeam, actor: keeper.name, label: 'Kaleci Kontrolü', detail: `${keeper.name} yüksek topu rahatça kontrol etti.`, weight: 3 },
+      { type: 'ONE_ON_ONE', team: attackingTeam, actor: attacker.name, label: 'Karşı Karşıya', detail: `${attacker.name} kaleciyle karşı karşıya kalacak boşluğu yakaladı.`, weight: 2 },
+      { type: 'KEEPER_ERROR', team: defendingTeam, actor: keeper.name, label: 'Kaleci Hatası', detail: `${keeper.name} geri pasta kısa süreli panik yaşadı.`, weight: 1 },
+      { type: 'CORNER', team: attackingTeam, actor: chooseSetPieceTaker(attackingTeam, 'CORNER'), label: 'Korner', detail: `${chooseSetPieceTaker(attackingTeam, 'CORNER')} korner için topun başına geçti.`, weight: 0 },
+      { type: 'FREE_KICK', team: attackingTeam, actor: chooseSetPieceTaker(attackingTeam, 'FREE_KICK'), label: 'Serbest Vuruş', detail: `${chooseSetPieceTaker(attackingTeam, 'FREE_KICK')} serbest vuruş için topun başına geçti.`, weight: 0 },
+      { type: 'INDIRECT_FREE_KICK', team: attackingTeam, actor: chooseSetPieceTaker(attackingTeam, 'INDIRECT_FREE_KICK'), label: 'Endirekt', detail: `${chooseSetPieceTaker(attackingTeam, 'INDIRECT_FREE_KICK')} endirekt serbest vuruşu hazırladı.`, weight: 0 },
+      { type: 'GOAL_KICK', team: defendingTeam, actor: keeper.name, label: 'Kale Vuruşu', detail: `${keeper.name} topu kale vuruşu için yerine koydu.`, weight: 0 },
+      { type: 'SHOT', team: attackingTeam, actor: attacker.name, label: 'Şut', detail: `${attacker.name} kaleyi yokladı.`, weight: 4 },
+      { type: 'SHOT_ON_TARGET', team: attackingTeam, actor: attacker.name, label: 'İsabetli Şut', detail: `${attacker.name} çerçeveyi bulan bir şut çıkardı.`, weight: 3 },
+      { type: 'SHOT_OFF_TARGET', team: attackingTeam, actor: attacker.name, label: 'İsabetsiz Şut', detail: `${attacker.name} vuruşunda top üstten auta gitti.`, weight: 3 },
+      { type: 'POST_HIT', team: attackingTeam, actor: attacker.name, label: 'Direk', detail: `${attacker.name} vurdu, top direkten oyun alanına döndü.`, weight: 1 },
+      { type: 'HEADER', team: attackingTeam, actor: attacker.name, label: 'Kafa Vuruşu', detail: `${attacker.name} ortada yükselip kafayı vurdu.`, weight: 2 },
+      { type: 'BICYCLE_KICK', team: attackingTeam, actor: attacker.name, label: 'Röveşata', detail: `${attacker.name} röveşata denedi, tribünlerden ses yükseldi.`, weight: 1 },
+      { type: 'VOLLEY', team: attackingTeam, actor: attacker.name, label: 'Volé', detail: `${attacker.name} seken topa gelişine volé vurdu.`, weight: 1 },
+      { type: 'PENALTY_AREA_ENTRY', team: attackingTeam, actor: attacker.name, label: 'Ceza Sahası', detail: `${attacker.name} topu ceza sahasına taşıdı.`, weight: 3 },
+      { type: 'BIG_CHANCE', team: attackingTeam, actor: attacker.name, label: 'Net Pozisyon', detail: `${attacker.name} büyük gol pozisyonuna girdi.`, weight: 2 },
+      { type: 'FOUL', team: defendingTeam, actor: defender.name, label: 'Faul', detail: `${defender.name} geç kaldı, hakem faulü verdi.`, weight: 3 },
+      { type: 'ADVANTAGE_PLAYED', team: attackingTeam, actor: attacker.name, label: 'Avantaj', detail: `Hakem avantajı oynattı, ${pressureStyle} atağı devam ediyor.`, weight: 2 },
+      { type: 'HANDBALL', team: defendingTeam, actor: defender.name, label: 'Elle Oynama', detail: `${defender.name} topa elle müdahale ettiği için hakem oyunu durdurdu.`, weight: 1 },
+      { type: 'REFEREE_WARNING', team: defendingTeam, actor: defender.name, label: 'Uyarı', detail: `Hakem ${defender.name} ile kısa bir uyarı konuşması yaptı.`, weight: 2 },
+      { type: 'DISSENT', team: attackingTeam, actor: attacker.name, label: 'İtiraz', detail: `${attacker.name} karar sonrası hakeme itiraz etti.`, weight: 1 },
+      { type: 'MINOR_INJURY', team: attackingTeam, actor: attacker.name, label: 'Hafif Sakatlık', detail: `${attacker.name} kısa süre sekerek devam etti.`, weight: 1 },
+      { type: 'CRAMP', team: attackingTeam, actor: attacker.name, label: 'Kramp', detail: `${attacker.name} tempo sonrası kramp belirtisi gösterdi.`, weight: currMin > 70 ? 2 : 0 },
+      { type: 'STAMINA_DROP', team: attackingTeam, actor: attacker.name, label: 'Yorgunluk', detail: `${attacker.name} için yorgunluk seviyesi belirgin şekilde yükseldi.`, weight: currMin > 60 ? 2 : 1 },
+      { type: 'TACTIC_CHANGE', team: attackingTeam, actor: attackClub.shortName, label: 'Taktik', detail: `${attackClub.shortName} topsuz oyunda dizilişini değiştirdi.`, weight: 1 },
+      { type: 'ATTACKING_PUSH', team: attackingTeam, actor: attackClub.shortName, label: 'Hücuma Çıkma', detail: `${attackClub.shortName} blok halinde öne çıktı.`, weight: 2 },
+      { type: 'DEFENSIVE_DROP', team: defendingTeam, actor: defenseClub.shortName, label: 'Defansa Çekilme', detail: `${defenseClub.shortName} savunma bloğunu geriye çekti.`, weight: 2 },
+      { type: 'COUNTER_ATTACK', team: attackingTeam, actor: attacker.name, label: 'Kontra Başladı', detail: `${attacker.name} topu kapar kapmaz kontra atağı başlattı.`, weight: 2 },
+      { type: 'TACTIC_CHANGE', team: defendingTeam, actor: defenseClub.shortName, label: 'Pres Seviyesi', detail: `${defenseClub.shortName} pres seviyesini artırdı.`, weight: 1 },
+      { type: 'VAR_CHECK', team: attackingTeam, actor: 'VAR', label: 'VAR', detail: `Pozisyon kısa süre VAR tarafından kontrol edildi.`, weight: 1 },
+      { type: 'VAR_DECISION', team: attackingTeam, actor: 'VAR', label: 'VAR Sonucu', detail: `VAR kontrolü sonrası hakemin kararı değişmedi.`, weight: 1 },
+      { type: 'OFFSIDE_TRAP', team: defendingTeam, actor: defender.name, label: 'Ofsayt Tuzağı', detail: `${defender.name} savunma çizgisini doğru kurdu, ofsayt tuzağı işledi.`, weight: 2 },
+      { type: 'DEFENSIVE_LINE_ERROR', team: defendingTeam, actor: defender.name, label: 'Çizgi Hatası', detail: `${defender.name} çizgiyi bozunca savunma arkasında boşluk doğdu.`, weight: 1 },
+      { type: 'INDIVIDUAL_ERROR', team: defendingTeam, actor: defender.name, label: 'Bireysel Hata', detail: `${defender.name} kontrol hatası yaptı, rakip baskıyı artırdı.`, weight: 1 },
+      { type: 'RUN_IN_BEHIND', team: attackingTeam, actor: attacker.name, label: 'Arkaya Koşu', detail: `${attacker.name} savunma arkasına zamanlamalı koşu attı.`, weight: 3 },
+      { type: 'COUNTER_ATTACK', team: attackingTeam, actor: attacker.name, label: 'Kontra Atak', detail: `${attacker.name} açık alanda hızlı kontra atağı sürükledi.`, weight: 3 },
+      { type: 'WING_PATTERN', team: attackingTeam, actor: attacker.name, label: 'Kanat Organizasyonu', detail: `${attackClub.shortName} kanatta üçgen paslarla boşluk aradı.`, weight: 3 },
+      { type: 'CENTRAL_ATTACK', team: attackingTeam, actor: attacker.name, label: 'Göbekten Atak', detail: `${attackClub.shortName} merkezden seri paslarla geldi.`, weight: 3 },
+      { type: 'FINAL_THIRD_PRESS', team: attackingTeam, actor: attacker.name, label: 'Ceza Sahası Baskısı', detail: `${attackClub.shortName} rakip ceza sahasında yoğun baskı kurdu.`, weight: 2 },
+      { type: 'TIME_WASTING', team: defendingTeam, actor: keeper.name, label: 'Zaman Geçirme', detail: `${keeper.name} oyunu başlatmak için ağır davrandı.`, weight: currMin > 75 ? 2 : 0 }
+      ,{ type: 'DROP_BALL', team: attackingTeam, actor: 'Hakem', label: 'Hakem Atışı', detail: 'Kısa duraklama sonrası oyun hakem atışıyla başladı.', weight: 1 }
+      ,{ type: 'FIRST_TOUCH', team: attackingTeam, actor: attacker.name, label: 'İlk Kontrol', detail: `${attacker.name} gelen topu ilk dokunuşta kontrol etti.`, weight: 4 }
+      ,{ type: 'CONTROL', team: attackingTeam, actor: attacker.name, label: 'Kontrol', detail: `${attacker.name} topu kontrol altına aldı.`, weight: 5 }
+      ,{ type: 'CARRY', team: attackingTeam, actor: attacker.name, label: 'Top Taşıma', detail: `${attacker.name} topu metrelerce taşıdı.`, weight: 4 }
+      ,{ type: 'DUEL', team: attackingTeam, actor: attacker.name, label: 'İkili Mücadele', detail: `${attacker.name} yerdeki ikili mücadelede ayakta kaldı.`, weight: 4 }
+      ,{ type: 'AERIAL_DUEL', team: defendingTeam, actor: defender.name, label: 'Hava Topu', detail: `${defender.name} hava topu mücadelesini kazandı.`, weight: 3 }
+      ,{ type: 'LOOSE_BALL', team: attackingTeam, actor: attacker.name, label: 'Boşta Top', detail: 'Top kısa süre iki takım arasında boşta kaldı.', weight: 3 }
+      ,{ type: 'SECOND_BALL_WON', team: defendingTeam, actor: defender.name, label: 'İkinci Top', detail: `${defender.name} seken ikinci topu kazandı.`, weight: 3 }
+      ,{ type: 'SHOT_ASSIST', team: attackingTeam, actor: teammate.name, label: 'Şut Pası', detail: `${teammate.name}, ${attacker.name} için doğrudan şut pası verdi.`, weight: 2 }
+      ,{ type: 'REBOUND', team: attackingTeam, actor: attacker.name, label: 'Seken Top', detail: `${attacker.name} kaleciden dönen topa hareketlendi.`, weight: 2 }
+      ,{ type: 'GOAL_DISALLOWED', team: attackingTeam, actor: attacker.name, label: 'Gol İptal', detail: `${attacker.name} topu ağlara gönderdi ama pozisyon öncesinde ihlal tespit edildi.`, weight: 1 }
+      ,{ type: 'OWN_GOAL', team: defendingTeam, actor: defender.name, label: 'Kendi Kalesine', detail: `${defender.name} ters bir dokunuş yaptı; pozisyon son anda gol olmadan temizlendi.`, weight: 1 }
+      ,{ type: 'SECOND_YELLOW_RED', team: defendingTeam, actor: defender.name, label: 'İkinci Sarı', detail: `${defender.name} ikinci sarı kart riskiyle hakemden son uyarıyı aldı.`, weight: 1 }
+      ,{ type: 'MORALE_CHANGE', team: attackingTeam, actor: attackClub.shortName, label: 'Moral', detail: `${attackClub.shortName} üst üste pozisyonlarla moral üstünlüğü kurdu.`, weight: 2 }
+      ,{ type: 'MOMENTUM_SHIFT', team: attackingTeam, actor: attackClub.shortName, label: 'Momentum', detail: `Maçın momentumu ${attackClub.shortName} tarafına kaydı.`, weight: 2 }
+      ,{ type: 'SET_PIECE_ROUTINE', team: attackingTeam, actor: chooseSetPieceTaker(attackingTeam, 'FREE_KICK'), label: 'Duran Top Planı', detail: `${attackClub.shortName} duran top organizasyonu denedi.`, weight: 1 }
+      ,{ type: 'ATTACK_BUILDUP', team: attackingTeam, actor: attacker.name, label: 'Atak Kurulumu', detail: `${attackClub.shortName} sabırlı paslarla atağı olgunlaştırdı.`, weight: 4 }
+    ];
+
+    const style = attackingTeam === 'home' ? homeStyle : awayStyle;
+    const mentality = attackingTeam === 'home' ? homeMentality : awayMentality;
+    const isLeading = attackingTeam === 'home' ? homeScore > awayScore : awayScore > homeScore;
+    const isTrailing = attackingTeam === 'home' ? homeScore < awayScore : awayScore < homeScore;
+    const canEmitCandidate = (event: typeof regularEvents[number]) => {
+      const state = matchStateRef.current;
+      const nowTick = liveTickRef.current;
+      const teamId = getClubBySide(event.team).id;
+      const actorKey = getPlayerCooldownKey(event.team, event.actor);
+      const lastTwoSame = state.lastEventTypes.slice(-2).every(type => type === event.type) &&
+        state.lastEventPlayerIds.slice(-2).every(playerId => playerId === actorKey);
+      const previousType = state.lastEventTypes[state.lastEventTypes.length - 1];
+      const chainKey = previousType ? `${previousType}->${event.type}` : '';
+      return !lastTwoSame &&
+        (state.playerCooldowns[actorKey]?.[event.type] || 0) <= nowTick &&
+        (state.teamCooldowns[teamId]?.[event.type] || 0) <= nowTick &&
+        (!chainKey || (state.chainCooldowns[chainKey] || 0) <= nowTick);
+    };
+    const scoreContextualEvent = (event: typeof regularEvents[number], index: number) => {
+      let score = event.weight;
+      if (style === 'TIKI_TAKA' && ['PASS', 'CONTROL', 'FIRST_TOUCH', 'ATTACK_BUILDUP', 'KEY_PASS'].includes(event.type)) score += 5;
+      if (style === 'WING_PLAY' && ['CROSS', 'HEADER', 'WING_PATTERN', 'AERIAL_DUEL'].includes(event.type)) score += 5;
+      if (style === 'GEGENPRESS' && ['PRESSURE', 'PRESS_RECOVERY', 'BALL_RECOVERY', 'FINAL_THIRD_PRESS'].includes(event.type)) score += 5;
+      if (style === 'COUNTER_ATTACK' && ['COUNTER_ATTACK', 'THROUGH_BALL', 'RUN_IN_BEHIND', 'CARRY'].includes(event.type)) score += 5;
+      if (style === 'PARK_BUS' && ['CLEARANCE', 'BLOCK', 'DEFENSIVE_DROP', 'TIME_WASTING'].includes(event.type)) score += 4;
+      if (mentality === 'OVERLOAD' && ['BIG_CHANCE', 'SHOT', 'PENALTY_AREA_ENTRY'].includes(event.type)) score += 3;
+      if (mentality === 'DEFENSIVE' && ['CLEARANCE', 'INTERCEPTION', 'BLOCK', 'DEFENSIVE_DROP'].includes(event.type)) score += 3;
+      if (currMin > 70 && ['STAMINA_DROP', 'CRAMP', 'TIME_WASTING', 'MOMENTUM_SHIFT'].includes(event.type)) score += 3;
+      if (isLeading && currMin > 75 && ['TIME_WASTING', 'DEFENSIVE_DROP', 'CLEARANCE'].includes(event.type)) score += 5;
+      if (isTrailing && currMin > 65 && ['ATTACKING_PUSH', 'BIG_CHANCE', 'SHOT', 'ATTACK_BUILDUP'].includes(event.type)) score += 4;
+      return score + rng.range(0, 0.9) + index * 0.0001;
+    };
+    const event = regularEvents
+      .filter(event => event.weight > 0)
+      .filter(canEmitCandidate)
+      .map((item, index) => ({ item, score: scoreContextualEvent(item, index) }))
+      .sort((a, b) => b.score - a.score)[0]?.item;
+    if (!event) return;
+    pushMatchEvent(event.type, event.team, event.actor, event.detail, event.label, {
+      minute: currMin,
+      minGapTicks: 240,
+      sound: rng.next() < 0.16
+    });
+    if (['PASS', 'KEY_PASS', 'THROUGH_BALL', 'CROSS', 'ATTACK_BUILDUP'].includes(event.type)) {
+      pushMatchEvent('FIRST_TOUCH', attackingTeam, teammate.name, `${teammate.name} gelen topu ilk dokunuşta kontrol etti.`, 'İlk Kontrol', { minute: currMin, minGapTicks: 120 });
+      pushMatchEvent('CONTROL', attackingTeam, teammate.name, `${teammate.name} topu kontrol altına aldı ve yönünü kaleye çevirdi.`, 'Kontrol', { minute: currMin, minGapTicks: 120 });
+      if (['KEY_PASS', 'THROUGH_BALL', 'CROSS'].includes(event.type)) {
+        pushMatchEvent('SHOT_ASSIST', attackingTeam, event.actor, `${event.actor}, ${attacker.name} için doğrudan şut pası üretti.`, 'Şut Pası', { minute: currMin, minGapTicks: 160 });
+      }
+    }
+    if (['SHOT', 'BIG_CHANCE', 'SHOT_ASSIST'].includes(event.type)) {
+      pushMatchEvent('SHOT', attackingTeam, attacker.name, `${attacker.name} pozisyonun sonunda kaleyi yokladı.`, 'Şut', { minute: currMin, minGapTicks: 160 });
+    }
+    if (event.type === 'SAVE') {
+      pushMatchEvent('REBOUND', attackingTeam, attacker.name, `${keeper.name} kurtardı, ${attacker.name} seken topu takip ediyor.`, 'Seken Top', { minute: currMin, minGapTicks: 160 });
+    }
+  };
 
   useEffect(() => {
     const shouldPlayCrowd = !preMatchSetup && isSimulating && !matchDone && matchViewMode === '3D';
@@ -461,6 +913,10 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
 
   const resetLivePhysics = () => {
     liveTickRef.current = 0;
+    eventGateRef.current = {};
+    pendingRestartRef.current = null;
+    pendingBallActionRef.current = null;
+    resetMatchFlowState();
     debugRef.current = {
       lastSnapshot: '',
       sameSnapshotTicks: 0,
@@ -497,7 +953,13 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     setAwayShots(0);
     setPossession(50);
     scorersRef.current = [];
-    matchEventsRef.current = [];
+    matchEventsRef.current = [{
+      minute: 1,
+      type: 'KICK_OFF',
+      teamId: homeClub.id,
+      playerName: 'Hakem',
+      detail: `${homeClub.shortName} - ${awayClub.shortName} maçı başladı.`
+    }];
     setBall({ x: 50, y: 50 });
     setBallTarget({ x: 50, y: 50 });
     setLogs(["Hakem maçı başlatan düdüğü çalıyor! Her iki takıma da başarılar."]);
@@ -519,7 +981,11 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     phaseTicksRef.current = 0;
     pendingGoalRef.current = null;
     pendingShotRef.current = null;
+    pendingRestartRef.current = null;
+    pendingBallActionRef.current = null;
     lastPassTimeRef.current = 0;
+    lastPassTypeRef.current = null;
+    lastPasserNameRef.current = null;
   };
 
   const toggleSimulation = () => {
@@ -580,6 +1046,10 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     minuteRef.current = minute;
   }, [minute]);
 
+  useEffect(() => {
+    secondRef.current = second;
+  }, [second]);
+
   // Get active configurations depending on whether user is home or away
   const userSquad = isUserHome ? homeSquad : awaySquad;
   const starters = userSquad.filter(p => p.isStarting);
@@ -638,6 +1108,20 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     return rng.choice(topWindow)?.id;
   };
 
+  const chooseGoalKind = (rng: SeededRandom, team: TeamSide): GoalKind => {
+    const style = team === 'home' ? homeStyle : awayStyle;
+    const roll = rng.next();
+    const headerChance = style === 'WING_PLAY' ? 0.34 : 0.18;
+    const penaltyChance = style === 'TIKI_TAKA' ? 0.09 : 0.12;
+    const freeKickChance = 0.07;
+    const ownGoalChance = 0.035;
+    if (roll < penaltyChance) return 'PENALTY';
+    if (roll < penaltyChance + freeKickChance) return 'FREE_KICK';
+    if (roll < penaltyChance + freeKickChance + ownGoalChance) return 'OWN_GOAL';
+    if (roll < penaltyChance + headerChance) return 'HEADER';
+    return 'OPEN_PLAY';
+  };
+
   const prepareMatchPlan = (seed: number) => {
     const planSeed = (seed || 1) + hashSeed(`${homeClub.id}:${awayClub.id}:${homeMentality}:${awayMentality}:${homeStyle}:${awayStyle}:${homeFormation}:${awayFormation}`);
     const rng = new SeededRandom(planSeed);
@@ -664,7 +1148,9 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
           team,
           scorerId: choosePlannedScorer(rng, team),
           played: false,
-          y: clamp(47 + rng.range(-7, 7), 39, 61)
+          y: clamp(50 + rng.range(-15.5, 15.5), 34.5, 65.5),
+          height: clamp(rng.next() < 0.46 ? rng.range(0.35, 1.25) : rng.range(1.35, 2.55), 0.25, 2.62),
+          kind: chooseGoalKind(rng, team)
         });
       }
     };
@@ -682,15 +1168,68 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
 
   const getGoalBallPosition = (team: TeamSide, y: number) => ({
     x: team === 'home' ? 100 : 0,
-    y: clamp(y, 45, 55)
+    y: clamp(y, 34.5, 65.5)
   });
 
-  const recordGoalEvent = (goal: PlannedGoal, fallbackScorer?: string) => {
+  const getGoalKindText = (kind: GoalKind) => {
+    if (kind === 'PENALTY') {
+      return {
+        short: 'Penaltı',
+        detail: 'Penaltı noktasından soğukkanlı bir vuruşla kaleciyi ters köşeye yatırdı.',
+        log: 'penaltıyı gole çevirdi'
+      };
+    }
+    if (kind === 'HEADER') {
+      return {
+        short: 'Kafa golü',
+        detail: 'Kanattan gelen ortada zamanlamayı iyi ayarlayıp kafayla ağları buldu.',
+        log: 'harika bir kafa vuruşuyla golü buldu'
+      };
+    }
+    if (kind === 'FREE_KICK') {
+      return {
+        short: 'Frikik golü',
+        detail: 'Serbest vuruşta top barajı aşıp köşeden ağlara gitti.',
+        log: 'serbest vuruştan harika bir gol buldu'
+      };
+    }
+    if (kind === 'OWN_GOAL') {
+      return {
+        short: 'Kendi kalesine',
+        detail: 'Savunmacının ters dokunuşunda top kendi ağlarına gitti.',
+        log: 'rakibin ters dokunuşuyla golü buldu'
+      };
+    }
+    return {
+      short: 'Akan oyun',
+      detail: 'Akan oyun içinde gelişen pozisyonda kaleciyi çaresiz bıraktı.',
+      log: 'seed planındaki golünü buldu'
+    };
+  };
+
+  const resolveOwnGoalScorerName = (scoringTeam: TeamSide) => {
+    const defendingTeam = getOppositeTeam(scoringTeam);
+    const defenders = getRosterBySide(defendingTeam)
+      .filter(p => p.isStarting && p.position === 'DEF')
+      .sort((a, b) => (a.defending + a.rating) - (b.defending + b.rating));
+    return defenders[0]?.name || getRosterBySide(defendingTeam).find(p => p.isStarting && p.position !== 'GK')?.name || 'Savunmacı';
+  };
+
+  const recordGoalEvent = (goal: PlannedGoal, fallbackScorer?: string, shotOrigin?: { x: number; y: number }) => {
     const club = goal.team === 'home' ? homeClub : awayClub;
-    const scorerName = resolveGoalScorerName(goal, fallbackScorer);
+    const scorerName = goal.kind === 'OWN_GOAL' ? resolveOwnGoalScorerName(goal.team) : resolveGoalScorerName(goal, fallbackScorer);
     const goalMinute = Math.max(1, goal.minute);
-    const scorerStr = `${goalMinute}'. ${scorerName} (${club.shortName})`;
+    const goalKindText = getGoalKindText(goal.kind);
+    const scorerStr = `${goalMinute}'. ${scorerName} (${club.shortName}${goal.kind === 'PENALTY' ? ' P' : goal.kind === 'HEADER' ? ' Kafa' : goal.kind === 'FREE_KICK' ? ' FK' : goal.kind === 'OWN_GOAL' ? ' OG' : ''})`;
     const goalBallPosition = getGoalBallPosition(goal.team, goal.y);
+    const shotFrom = shotOrigin || {
+      x: goal.kind === 'PENALTY'
+        ? (goal.team === 'home' ? 88 : 12)
+        : goal.team === 'home' ? clamp(goalBallPosition.x - 18, 62, 86) : clamp(goalBallPosition.x + 18, 14, 38),
+      y: goal.kind === 'PENALTY'
+        ? 50
+        : clamp(goalBallPosition.y + (goal.team === 'home' ? -4 : 4), 36, 64)
+    };
     const ballState = ballSimRef.current;
 
     ballState.x = goalBallPosition.x;
@@ -710,12 +1249,60 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     playPhaseRef.current = 'CELEBRATION';
 
     scorersRef.current.push(scorerStr);
+    if (goal.kind === 'FREE_KICK') {
+      matchEventsRef.current.push({
+        minute: goalMinute,
+        type: 'FREE_KICK_TAKEN',
+        teamId: club.id,
+        teamSide: goal.team,
+        playerName: scorerName,
+        detail: `${scorerName} serbest vuruşu direkt kaleye kullandı.`,
+        commentary: `${scorerName} serbest vuruşu direkt kaleye kullandı.`
+      });
+    }
+    if (goal.kind === 'OWN_GOAL') {
+      matchEventsRef.current.push({
+        minute: goalMinute,
+        type: 'OWN_GOAL',
+        teamId: club.id,
+        teamSide: goal.team,
+        playerName: scorerName,
+        detail: `${scorerName} ters bir dokunuşla topu kendi ağlarına gönderdi.`,
+        commentary: `${scorerName} ters bir dokunuşla topu kendi ağlarına gönderdi.`
+      });
+    }
+    matchEventsRef.current.push({
+      minute: goalMinute,
+      type: goal.kind === 'HEADER' ? 'HEADER' : 'SHOT',
+      teamId: club.id,
+      teamSide: goal.team,
+      playerName: scorerName,
+      detail: goal.kind === 'HEADER' ? 'Kafa vuruşu kaleyi buldu.' : 'Gol öncesi şut çerçeveyi buldu.'
+    });
+    matchEventsRef.current.push({
+      minute: goalMinute,
+      type: 'BIG_CHANCE',
+      teamId: club.id,
+      playerName: scorerName,
+      detail: 'Net gol pozisyonu gole dönüştü.'
+    });
+    if (goal.kind === 'PENALTY') {
+      matchEventsRef.current.push({
+        minute: goalMinute,
+        type: 'PENALTY_TAKEN',
+        teamId: club.id,
+        teamSide: goal.team,
+        playerName: scorerName,
+        detail: `Ceza sahası içindeki müdahale sonrası hakem penaltı noktasını gösterdi. Topun başına ${scorerName} geçti.`
+      });
+    }
     matchEventsRef.current.push({
       minute: goalMinute,
       type: 'GOAL',
       teamId: club.id,
+      teamSide: goal.team,
       playerName: scorerName,
-      detail: 'Seed planına bağlı deterministik maç motorunda gelişen pozisyon.'
+      detail: goalKindText.detail
     });
 
     if (goal.team === 'home') {
@@ -730,14 +1317,18 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     setBallTarget(goalBallPosition);
     setLogs(prev => [
       ...prev,
-      `${goalMinute}' [GOOOL] - ${club.name} seed planındaki golünü buldu! Gol: ${scorerName}`
+      `${goalMinute}' [GOOOL] - ${club.name} ${goalKindText.log}! Gol: ${scorerName}`
     ]);
     setFxState({
       type: 'GOAL',
-      text: `GOOOL! ${scorerName} • ${club.shortName}`,
+      text: `GOOOL! ${scorerName} • ${goalKindText.short}`,
       team: goal.team,
       x: goalBallPosition.x,
-      y: goalBallPosition.y
+      y: goalBallPosition.y,
+      shotFromX: shotFrom.x,
+      shotFromY: shotFrom.y,
+      goalHeight: goal.height,
+      eventKey: liveTickRef.current + goalMinute * 1000
     });
   };
 
@@ -794,22 +1385,107 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         ballState.vy = 0;
         ballState.vz = 0;
         ballState.ownerId = null;
+        ballState.deadUntilTick = 0;
         ballState.looseUntilTick = tick + 20;
         ballPossessorIdRef.current = null;
         activeAttackerIdRef.current = null;
         intendedReceiverIdRef.current = null;
         passerIdRef.current = null;
+        lastPassTypeRef.current = null;
+        lastPasserNameRef.current = null;
+        pendingRestartRef.current = null;
+        setFxState(null);
+      };
+
+      const resumePendingRestart = () => {
+        const restart = pendingRestartRef.current;
+        if (!restart) {
+          resetForKickoff();
+          return;
+        }
+
+        const side = restart.team === 'home' ? 1 : -1;
+        const throwLineY = restart.y < 50 ? PLAYER_MIN_Y : PLAYER_MAX_Y;
+        const taker =
+          players.find(p => p.team === restart.team && p.name === restart.takerName) ||
+          players.find(p => p.team === restart.team && (restart.type === 'GOAL_KICK' ? p.position === 'GK' : p.position !== 'GK')) ||
+          players.find(p => p.team === restart.team) ||
+          null;
+        const startX = restart.type === 'THROW_IN' ? clamp(restart.x, FIELD_MIN_X, FIELD_MAX_X) : (taker ? clamp(taker.x, FIELD_MIN_X, FIELD_MAX_X) : restart.x);
+        const startY = restart.type === 'THROW_IN' ? throwLineY : (taker ? clamp(taker.y, BALL_MIN_Y, BALL_MAX_Y) : restart.y);
+        const target =
+          restart.type === 'GOAL_KICK'
+            ? { x: restart.team === 'home' ? 42 : 58, y: 50 }
+            : restart.type === 'CORNER'
+              ? { x: restart.team === 'home' ? 84 : 16, y: 50 }
+              : restart.type === 'PENALTY'
+                ? { x: restart.team === 'home' ? 101 : -1, y: 50 }
+                : restart.type === 'THROW_IN'
+                  ? { x: clamp(restart.x + side * 14, FIELD_MIN_X, FIELD_MAX_X), y: clamp(50 + (restart.y - 50) * 0.35, BALL_MIN_Y, BALL_MAX_Y) }
+                  : { x: clamp(restart.x + side * 20, FIELD_MIN_X, FIELD_MAX_X), y: clamp(restart.y, BALL_MIN_Y, BALL_MAX_Y) };
+        const dir = normalize(target.x - startX, target.y - startY);
+        const power =
+          restart.type === 'GOAL_KICK' ? 58 :
+          restart.type === 'CORNER' ? 46 :
+          restart.type === 'PENALTY' ? 72 :
+          restart.type === 'THROW_IN' ? 30 : 42;
+
+        if (taker) {
+          taker.x = startX;
+          taker.y = startY;
+          taker.vx = 0;
+          taker.vy = 0;
+          taker.restartAction = restart.type === 'THROW_IN' ? 'THROW_IN' : undefined;
+          taker.lastTouchTick = tick;
+        }
+
+        ballState.x = clamp(startX + dir.x * 1.4, 0, 100);
+        ballState.y = clamp(startY + dir.y * 1.4, BALL_MIN_Y, BALL_MAX_Y);
+        ballState.z = restart.type === 'THROW_IN' || restart.type === 'CORNER' || restart.type === 'GOAL_KICK' ? 1.1 : 0.2;
+        ballState.vx = dir.x * power;
+        ballState.vy = dir.y * power;
+        ballState.vz = restart.type === 'PENALTY' ? 2.4 : restart.type === 'GOAL_KICK' ? 7.5 : restart.type === 'CORNER' ? 6.2 : 3.2;
+        ballState.ownerId = null;
+        ballState.lastTouchTeam = restart.team;
+        ballState.lastTouchPlayerId = taker?.id || null;
+        ballState.looseUntilTick = tick + 10;
+        ballState.deadUntilTick = 0;
+        ballPossessorIdRef.current = null;
+        activeAttackerIdRef.current = null;
+        intendedReceiverIdRef.current = null;
+        passerIdRef.current = null;
+        pendingRestartRef.current = null;
+        pitchPlayersRef.current = players.map(p => p.id === taker?.id ? { ...p, restartAction: undefined } : p);
+        syncMatchState(restart.team, null, ballState.x, ballState.y);
         setFxState(null);
       };
 
       if (ballState.deadUntilTick > tick) {
-        const nextPlayers = players.map(p => ({
-          ...p,
-          vx: p.vx * 0.82,
-          vy: p.vy * 0.82,
-          x: p.x + (p.baseX - p.x) * 0.045,
-          y: p.y + (p.baseY - p.y) * 0.045
-        }));
+        const restart = pendingRestartRef.current;
+        const nextPlayers = players.map(p => {
+          if (restart && restart.type === 'THROW_IN' && p.team === restart.team && p.name === restart.takerName) {
+            const targetX = clamp(restart.x, FIELD_MIN_X, FIELD_MAX_X);
+            const targetY = restart.y < 50 ? PLAYER_MIN_Y : PLAYER_MAX_Y;
+            return {
+              ...p,
+              vx: 0,
+              vy: 0,
+              x: p.x + (targetX - p.x) * 0.35,
+              y: p.y + (targetY - p.y) * 0.35,
+              heading: restart.team === 'home' ? 0 : Math.PI,
+              restartAction: 'THROW_IN' as const
+            };
+          }
+
+          return {
+            ...p,
+            restartAction: undefined,
+            vx: p.vx * 0.82,
+            vy: p.vy * 0.82,
+            x: p.x + (p.baseX - p.x) * 0.045,
+            y: p.y + (p.baseY - p.y) * 0.045
+          };
+        });
         pitchPlayersRef.current = nextPlayers;
         setPitchPlayers(nextPlayers);
         setBall({ x: clamp(ballState.x, 0, 100), y: clamp(ballState.y, 0, 100) });
@@ -830,8 +1506,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         if (debugEnabled) {
           console.info('[match-debug] leaving dead-ball state ' + JSON.stringify({ tick, deadUntilTick: ballState.deadUntilTick }));
         }
-        ballState.deadUntilTick = 0;
-        resetForKickoff();
+        resumePendingRestart();
       }
 
       const getTeamPlayers = (team: TeamSide) => players.filter(p => p.team === team && p.position !== 'GK');
@@ -895,6 +1570,62 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         return { player: best, dist: bestDist };
       };
 
+      const stopForRestart = (
+        eventType: MatchEventType,
+        restartTeam: TeamSide,
+        x: number,
+        y: number,
+        playerName: string,
+        detail: string,
+        label: string
+      ) => {
+        const club = restartTeam === 'home' ? homeClub : awayClub;
+        const restartX = clamp(x, FIELD_MIN_X, FIELD_MAX_X);
+        const restartY = clamp(y, BALL_MIN_Y, BALL_MAX_Y);
+        const restartKind = eventType === 'OFFSIDE' ? 'FREE_KICK' : eventType;
+
+        if (eventType === 'OFFSIDE') {
+          pushMatchEvent('OFFSIDE', restartTeam, playerName, detail, label, { minGapTicks: 12 });
+          pushSetPieceSequence('FREE_KICK', restartTeam, chooseSetPieceTaker(restartTeam, 'FREE_KICK'), `${club.shortName} ofsayt sonrası serbest vuruşla oyunu başlatacak.`, 'Serbest Vuruş');
+        } else {
+          pushSetPieceSequence(eventType, restartTeam, playerName, detail, label);
+        }
+        pendingRestartRef.current = {
+          type: restartKind,
+          team: restartTeam,
+          takerName: eventType === 'OFFSIDE' ? chooseSetPieceTaker(restartTeam, 'FREE_KICK') : playerName,
+          x: restartX,
+          y: restartY
+        };
+
+        ballState.x = restartX;
+        ballState.y = restartY;
+        ballState.z = 0;
+        ballState.vx = 0;
+        ballState.vy = 0;
+        ballState.vz = 0;
+        ballState.ownerId = null;
+        ballState.lastTouchTeam = restartTeam;
+        ballState.looseUntilTick = tick + 20;
+        ballState.deadUntilTick = tick + 34;
+        ballPossessorIdRef.current = null;
+        pendingBallActionRef.current = null;
+        activeAttackerIdRef.current = null;
+        intendedReceiverIdRef.current = null;
+        passerIdRef.current = null;
+        setBall({ x: restartX, y: restartY });
+        setBallTarget({ x: restartX, y: restartY });
+        setFxState({
+          type: 'NONE',
+          text: `${label}: ${playerName}`,
+          team: restartTeam,
+          x: restartX,
+          y: restartY
+        });
+        setTimeout(() => setFxState(null), 1600);
+        soundEngine.playWhistle(false);
+      };
+
       const registerGoal = (scoringTeam: TeamSide, scorer?: LivePitchPlayer | null) => {
         const plannedGoal = consumeDuePlannedGoal(scoringTeam, minuteRef.current + 1);
         if (!plannedGoal) {
@@ -919,8 +1650,9 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         ballState.vy = 0;
         ballState.vz = 0;
         ballPossessorIdRef.current = null;
+        pendingBallActionRef.current = null;
         playPhaseRef.current = 'CELEBRATION';
-        recordGoalEvent(plannedGoal, scorer?.name);
+        recordGoalEvent(plannedGoal, scorer?.name, scorer ? { x: scorer.x, y: scorer.y } : { x: ballState.x, y: ballState.y });
       };
 
       const kickBall = (kicker: LivePitchPlayer, targetX: number, targetY: number, power: number, loft: number) => {
@@ -938,6 +1670,78 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         ballPossessorIdRef.current = null;
         kicker.lastTouchTick = tick;
         soundEngine.playKick();
+      };
+
+      const resolvePendingBallAction = (nextPlayers: LivePitchPlayer[]) => {
+        const pending = pendingBallActionRef.current;
+        if (!pending || tick < pending.dueTick) return false;
+
+        const kicker = nextPlayers.find(p => p.id === pending.kickerId) || null;
+        if (!kicker || ballState.ownerId !== kicker.id) {
+          pendingBallActionRef.current = null;
+          return false;
+        }
+
+        const contactDistance = distance(kicker.x, kicker.y, ballState.x, ballState.y);
+        if (contactDistance > 2.2) {
+          pending.dueTick = tick + 1;
+          return false;
+        }
+
+        if (pending.kind === 'SHOT') {
+          activeAttackerIdRef.current = kicker.id;
+          shootTypeRef.current = 'GOAL';
+          flightTargetRef.current = { x: kicker.team === 'home' ? 97 : 3, y: pending.targetY };
+          ballState.lastShotTick = tick;
+          if (kicker.team === 'home') setHomeShots(prev => prev + 1);
+          else setAwayShots(prev => prev + 1);
+          pushMatchEvent(
+            'SHOT',
+            kicker.team,
+            kicker.name,
+            `${kicker.name} kaleyi gördü ve vuruşunu yaptı.`,
+            'Şut',
+            { minGapTicks: 55 }
+          );
+          kickBall(kicker, pending.targetX, pending.targetY, pending.power, pending.loft);
+        } else {
+          const receiver = nextPlayers.find(p => p.id === pending.receiverId) || null;
+          if (pending.passType) {
+            pushMatchEvent(
+              pending.passType,
+              kicker.team,
+              kicker.name,
+              pending.eventDetail,
+              pending.eventLabel,
+              { minGapTicks: pending.passType === 'PASS' ? 90 : 70 }
+            );
+            lastPassTypeRef.current = pending.passType;
+            lastPasserNameRef.current = kicker.name;
+          }
+          if (receiver) {
+            intendedReceiverIdRef.current = receiver.id;
+          }
+          passerIdRef.current = kicker.id;
+          passTicksRef.current = tick;
+          setPassingLines(prev => [
+            ...prev,
+            { fromX: kicker.x, fromY: kicker.y, toX: receiver?.x ?? pending.targetX, toY: receiver?.y ?? pending.targetY, time: Date.now() }
+          ].slice(-5));
+          kickBall(kicker, pending.targetX, pending.targetY, pending.power, pending.loft);
+          if (pending.loft > 3 && receiver && pending.passType === 'CROSS' && rng.next() < 0.38) {
+            matchEventsRef.current.push({
+              minute: pending.minute,
+              type: 'HEADER',
+              teamId: kicker.team === 'home' ? homeClub.id : awayClub.id,
+              playerName: receiver.name,
+              detail: `${kicker.name} ortaladı, ${receiver.name} kafayla indirdi.`
+            });
+            appendMatchLog(`${pending.minute}' ${kicker.name} ortaladı, ${receiver.name} kafayla arkadaşına indirdi.`);
+          }
+        }
+
+        pendingBallActionRef.current = null;
+        return true;
       };
 
       const choosePassTarget = (passer: LivePitchPlayer) => {
@@ -1002,30 +1806,117 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
           const defenderProfile = getTacticalProfile(nearestOpponent.player.team);
           const stealChance = 0.06 + defenderProfile.press * 0.035 + (nearestOpponent.player.rating - currentOwner.rating) * 0.002;
           if (rng.next() < stealChance) {
+            const nearLastLine = currentOwner.team === 'home' ? currentOwner.x > 78 : currentOwner.x < 22;
+            const tackleType: MatchEventType = nearLastLine && rng.next() < 0.32
+              ? 'LAST_MAN_TACKLE'
+              : rng.next() < 0.24
+                ? 'SLIDE_TACKLE'
+                : 'TACKLE';
             ballState.ownerId = nearestOpponent.player.id;
             ballState.lastTouchTeam = nearestOpponent.player.team;
             ballState.lastTouchPlayerId = nearestOpponent.player.id;
             nearestOpponent.player.actionCooldown = tick + 18;
             ballPossessorIdRef.current = nearestOpponent.player.id;
+            pushMatchEvent(
+              tackleType,
+              nearestOpponent.player.team,
+              nearestOpponent.player.name,
+              tackleType === 'LAST_MAN_TACKLE'
+                ? `${nearestOpponent.player.name} son adam olarak ${currentOwner.name} karşısında kusursuz müdahale yaptı.`
+                : tackleType === 'SLIDE_TACKLE'
+                  ? `${nearestOpponent.player.name} kayarak müdahaleyle topu ${currentOwner.name} ayağından aldı.`
+                  : `${nearestOpponent.player.name} zamanında müdahale ederek topu kazandı.`,
+              tackleType === 'LAST_MAN_TACKLE' ? 'Son Adam' : tackleType === 'SLIDE_TACKLE' ? 'Kayarak Müdahale' : 'Müdahale',
+              { minGapTicks: 70 }
+            );
+            if (defenderProfile.press > 1.1) {
+              pushMatchEvent(
+                'PRESS_RECOVERY',
+                nearestOpponent.player.team,
+                nearestOpponent.player.name,
+                `${nearestOpponent.player.name} yoğun presin ödülünü top kazanarak aldı.`,
+                'Pres Kazancı',
+                { minGapTicks: 120 }
+              );
+            }
           }
-        } else if (tick >= currentOwner.actionCooldown) {
-          const shootDecision = (0.12 + centralAngle * 0.25 + ownerProfile.shotBias + pressurePanic * 0.1) * shootingProfile;
-          const passDecision = 0.28 + pressurePanic * 0.42 + ownerProfile.shortness * 0.09;
-          const dribbleDecision = 0.17 * ownerProfile.dribbleBias * (1 - pressurePanic * 0.45);
+        } else if (tick >= currentOwner.actionCooldown && !pendingBallActionRef.current) {
+          const shootDecision = (0.055 + centralAngle * 0.14 + ownerProfile.shotBias * 0.72 + pressurePanic * 0.055) * shootingProfile;
+          const passDecision = 0.38 + pressurePanic * 0.46 + ownerProfile.shortness * 0.12;
+          const dribbleDecision = 0.21 * ownerProfile.dribbleBias * (1 - pressurePanic * 0.38);
+          const inPenaltyArea = currentOwner.team === 'home'
+            ? currentOwner.x > 84 && currentOwner.y > 32 && currentOwner.y < 68
+            : currentOwner.x < 16 && currentOwner.y > 32 && currentOwner.y < 68;
+
+          if (inPenaltyArea && pressure < 4.2 && rng.next() < 0.018 + pressurePanic * 0.035) {
+            if (rng.next() < 0.28) {
+              pushMatchEvent(
+                'VAR_CHECK',
+                currentOwner.team,
+                'VAR',
+                'Ceza sahasındaki temas kısa süre VAR tarafından kontrol edildi.',
+                'VAR',
+                { minGapTicks: 300 }
+              );
+            }
+            const plannedPenalty = consumeDuePlannedGoal(currentOwner.team, minuteRef.current + 1);
+            if (plannedPenalty) {
+              const penaltyTaker = chooseSetPieceTaker(currentOwner.team, 'PENALTY');
+              plannedPenalty.kind = 'PENALTY';
+              recordGoalEvent(plannedPenalty, penaltyTaker, { x: currentOwner.team === 'home' ? 88 : 12, y: 50 });
+              return;
+            }
+
+            if (currentOwner.team === 'home') setHomeShots(prev => prev + 1);
+            else setAwayShots(prev => prev + 1);
+            const penaltyTaker = chooseSetPieceTaker(currentOwner.team, 'PENALTY');
+            const penaltyKeeper = chooseSetPieceTaker(getOppositeTeam(currentOwner.team), 'GOAL_KICK');
+            stopForRestart(
+              'PENALTY',
+              currentOwner.team,
+              currentOwner.team === 'home' ? 88 : 12,
+              50,
+              penaltyTaker,
+              `${currentOwner.name} ceza sahasında yerde kaldı, hakem penaltıyı verdi. Topun başına ${penaltyTaker} geçti; ${penaltyKeeper} köşeyi doğru tahmin edip vuruşu çıkardı.`,
+              'PENALTI'
+            );
+            pushMatchEvent(
+              'PENALTY_SAVE',
+              getOppositeTeam(currentOwner.team),
+              penaltyKeeper,
+              `${penaltyKeeper}, ${penaltyTaker} tarafından kullanılan penaltıda köşeyi doğru tahmin edip topu çıkardı.`,
+              'Penaltı Kurtarışı',
+              { minGapTicks: 120 }
+            );
+            pushMatchEvent(
+              'PENALTY_MISS',
+              currentOwner.team,
+              penaltyTaker,
+              `${penaltyTaker} penaltıda ${penaltyKeeper} engeline takıldı.`,
+              'Penaltı Kaçtı',
+              { minGapTicks: 120 }
+            );
+            return;
+          }
 
           if (shotLane && rng.next() < shootDecision) {
             const goalX = currentOwner.team === 'home' ? 101.5 : -1.5;
             const aimNoise = rng.range(-9, 9) * (1.08 - currentOwner.rating / 120);
             const goalY = clamp(50 + aimNoise, 35, 65);
             currentOwner.actionCooldown = tick + 32;
-            activeAttackerIdRef.current = currentOwner.id;
-            shootTypeRef.current = 'GOAL';
-            flightTargetRef.current = { x: currentOwner.team === 'home' ? 97 : 3, y: goalY };
-            ballState.lastShotTick = tick;
-            if (currentOwner.team === 'home') setHomeShots(prev => prev + 1);
-            else setAwayShots(prev => prev + 1);
-            kickBall(currentOwner, goalX, goalY, 78 + currentOwner.rating * 0.22, 5.5 + rng.next() * 3.5);
-            setLogs(prev => [...prev, `${Math.max(1, minuteRef.current)}' ${currentOwner.name} kaleyi gördü ve sert vurdu!`]);
+            pendingBallActionRef.current = {
+              kind: 'SHOT',
+              kickerId: currentOwner.id,
+              team: currentOwner.team,
+              dueTick: tick + 1,
+              targetX: goalX,
+              targetY: goalY,
+              power: 78 + currentOwner.rating * 0.22,
+              loft: 5.5 + rng.next() * 3.5,
+              eventLabel: 'Şut',
+              eventDetail: `${currentOwner.name} kaleyi gördü ve vuruşunu yaptı.`,
+              minute: Math.max(1, minuteRef.current)
+            };
           } else if (pressure < 8 || rng.next() < passDecision) {
             const receiver = choosePassTarget(currentOwner);
             if (receiver) {
@@ -1033,10 +1924,30 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
               const rawTargetX = receiver.x + receiver.vx * 0.24 + lead;
               const rawTargetY = receiver.y + receiver.vy * 0.24;
               const passDistance = distance(currentOwner.x, currentOwner.y, rawTargetX, rawTargetY);
+              const receiverBeyondLine = receiver.team === 'home'
+                ? receiver.x > Math.max(82, ballState.x + 3.2)
+                : receiver.x < Math.min(18, ballState.x - 3.2);
+              const forwardPass = receiver.team === 'home' ? rawTargetX > currentOwner.x + 4 : rawTargetX < currentOwner.x - 4;
+              if (forwardPass && receiverBeyondLine && rng.next() < 0.18 + Math.max(0, ownerProfile.directness - 1) * 0.1) {
+                stopForRestart(
+                  'OFFSIDE',
+                  receiver.team === 'home' ? 'away' : 'home',
+                  receiver.x,
+                  receiver.y,
+                  receiver.name,
+                  `${receiver.name} savunma arkasına erken koştu, yardımcı hakem ofsayt bayrağını kaldırdı.`,
+                  'OFSAYT'
+                );
+                pushMatchEvent('OFFSIDE_TRAP', receiver.team === 'home' ? 'away' : 'home', receiver.name, `${receiver.name} savunma arkasına erken kaçınca ofsayt tuzağı başarılı oldu.`, 'Ofsayt Tuzağı', { minGapTicks: 180 });
+                return;
+              }
               const passingSkill = clamp((currentOwner.rating - 48) / 42, 0.35, 1.2);
               const laneError = (1.22 - passingSkill) * 2.8 + pressurePanic * 3.6 + (passDistance > 30 ? 1.1 : 0);
               const targetX = clamp(rawTargetX + rng.range(-laneError, laneError) * 0.72, 0, 100);
               const targetY = clamp(rawTargetY + rng.range(-laneError, laneError), BALL_MIN_Y, BALL_MAX_Y);
+              const attackingBoxTarget = receiver.team === 'home'
+                ? targetX > 76 && targetY > 35 && targetY < 65
+                : targetX < 24 && targetY > 35 && targetY < 65;
               currentOwner.actionCooldown = tick + Math.floor((14 + rng.range(0, 12)) / clamp(ownerProfile.shortness, 0.8, 1.35));
               intendedReceiverIdRef.current = receiver.id;
               passerIdRef.current = currentOwner.id;
@@ -1050,9 +1961,37 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
               const loft = passDistance > 24 && ownerProfile.directness > 0.95
                 ? 3.2 + ownerProfile.directness * 0.6 + pressurePanic * 1.2
                 : 0.8 + pressurePanic * 0.8;
-              kickBall(currentOwner, targetX, targetY, passPower, loft);
+              const isCross = loft > 3 && Math.abs(targetY - 50) > 17 && attackingBoxTarget;
+              const isThroughBall = forwardPass && passDistance > 18 && Math.abs(targetY - currentOwner.y) < 18;
+              const passType: MatchEventType = isCross ? 'CROSS' : isThroughBall ? 'THROUGH_BALL' : attackingBoxTarget ? 'KEY_PASS' : 'PASS';
+              pendingBallActionRef.current = {
+                kind: 'PASS',
+                kickerId: currentOwner.id,
+                team: currentOwner.team,
+                dueTick: tick + 1,
+                targetX,
+                targetY,
+                power: passPower,
+                loft,
+                passType,
+                receiverId: receiver.id,
+                receiverName: receiver.name,
+                eventLabel: passType === 'CROSS' ? 'Orta' : passType === 'THROUGH_BALL' ? 'Ara Pası' : passType === 'KEY_PASS' ? 'Anahtar Pas' : 'Pas',
+                eventDetail: passType === 'CROSS'
+                  ? `${currentOwner.name} kanattan ceza sahasına orta gönderdi.`
+                  : passType === 'THROUGH_BALL'
+                    ? `${currentOwner.name} savunma arkasına ara pası denedi.`
+                    : passType === 'KEY_PASS'
+                      ? `${currentOwner.name} ceza sahasına anahtar pas attı.`
+                      : `${currentOwner.name}, ${receiver.name} yönüne pas oynadı.`,
+                minute: Math.max(1, minuteRef.current)
+              };
             }
           } else if (rng.next() < dribbleDecision) {
+            pushMatchEvent('DRIBBLE', currentOwner.team, currentOwner.name, `${currentOwner.name} rakibinin üstüne driplinge kalktı.`, 'Dripling', { minGapTicks: 70 });
+            if (rng.next() < currentOwner.rating / 130) {
+              pushMatchEvent('DRIBBLE_SUCCESS', currentOwner.team, currentOwner.name, `${currentOwner.name} bire birde rakibini geçti.`, 'Başarılı Dripling', { minGapTicks: 120 });
+            }
             currentOwner.actionCooldown = tick + 8 + Math.floor(rng.range(0, 8));
           } else {
             currentOwner.actionCooldown = tick + 12 + Math.floor(rng.range(0, 12));
@@ -1164,6 +2103,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
           vx: nextX === FIELD_MIN_X || nextX === FIELD_MAX_X ? 0 : vx,
           vy: pinnedOutwardY ? 0 : vy,
           heading: Math.abs(vx) + Math.abs(vy) > 0.02 ? Math.atan2(vy, vx) : p.heading,
+          restartAction: undefined,
           stamina: clamp(p.stamina - (sprint ? 0.012 : 0.004), 45, 100)
         };
       });
@@ -1203,6 +2143,8 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         }
       }
 
+      resolvePendingBallAction(nextPlayers);
+
       const ownerAfterMove = ballState.ownerId ? nextPlayers.find(p => p.id === ballState.ownerId) || null : null;
       if (ownerAfterMove) {
         const side = ownerAfterMove.team === 'home' ? 1 : -1;
@@ -1234,8 +2176,19 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
       }
 
       if (ballState.y < BALL_MIN_Y || ballState.y > BALL_MAX_Y) {
-        ballState.y = clamp(ballState.y, BALL_MIN_Y, BALL_MAX_Y);
-        ballState.vy = -ballState.vy * 0.42;
+        const throwInTeam: TeamSide = ballState.lastTouchTeam === 'home' ? 'away' : 'home';
+        const throwY = ballState.y < BALL_MIN_Y ? BALL_MIN_Y : BALL_MAX_Y;
+        const throwTaker = chooseSetPieceTaker(throwInTeam, 'THROW_IN');
+        stopForRestart(
+          'THROW_IN',
+          throwInTeam,
+          ballState.x,
+          throwY,
+          throwTaker,
+          `Top taç çizgisini geçti. ${throwTaker}, ${throwInTeam === 'home' ? homeClub.shortName : awayClub.shortName} adına taç atışını kullanacak.`,
+          'TAÇ'
+        );
+        return;
       }
 
       const looseSpeed = Math.hypot(ballState.vx, ballState.vy);
@@ -1253,7 +2206,19 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
             ballState.lastTouchTeam = p.team;
             ballState.lastTouchPlayerId = p.id;
             p.lastTouchTick = tick;
-            setLogs(prev => [...prev, `${Math.max(1, minuteRef.current)}' ${p.name} kalede kritik bir müdahale yaptı.`]);
+            const saveType: MatchEventType = looseSpeed > 44 ? 'REFLEX_SAVE' : rng.next() < 0.28 ? 'KEEPER_PUNCH' : 'SAVE';
+            pushMatchEvent(
+              saveType,
+              p.team,
+              p.name,
+              saveType === 'REFLEX_SAVE'
+                ? `${p.name} yakın mesafeden refleks kurtarışı yaptı.`
+                : saveType === 'KEEPER_PUNCH'
+                  ? `${p.name} sert gelen topu yumruklayarak uzaklaştırdı.`
+                  : `${p.name} kalede kritik bir kurtarış yaptı.`,
+              saveType === 'REFLEX_SAVE' ? 'Refleks' : saveType === 'KEEPER_PUNCH' ? 'Yumruklama' : 'Kurtarış',
+              { minGapTicks: 80 }
+            );
             break;
           }
 
@@ -1307,12 +2272,27 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
               ballState.vy += rng.range(-8, 8);
               ballState.looseUntilTick = tick + 5;
               ballPossessorIdRef.current = null;
+              pushMatchEvent(
+                receivingPass ? 'PASS_FAILED' : 'DRIBBLE_FAILED',
+                p.team,
+                p.name,
+                receivingPass
+                  ? `${p.name} gelen pası kontrol edemedi, top ayağından açıldı.`
+                  : `${p.name} dripling sırasında topu fazla açtı.`,
+                receivingPass ? 'Başarısız Pas' : 'Başarısız Dripling',
+                { minGapTicks: 90 }
+              );
+              pushMatchEvent('TURNOVER', p.team, p.name, `${p.name} baskı altında top kaybı yaptı.`, 'Top Kaybı', { minGapTicks: 110 });
             }
 
             if (intendedReceiverIdRef.current === p.id) {
               intendedReceiverIdRef.current = null;
               passerIdRef.current = null;
             } else if (canInterceptPass) {
+              pushMatchEvent('INTERCEPTION', p.team, p.name, `${p.name} pas arasına girerek topu kaptı.`, 'Araya Girme', { minGapTicks: 70 });
+              if (rng.next() < 0.24) {
+                pushMatchEvent('COUNTER_ATTACK', p.team, p.name, `${p.name} topu kapar kapmaz kontra atağı başlattı.`, 'Kontra Başladı', { minGapTicks: 160 });
+              }
               intendedReceiverIdRef.current = null;
               passerIdRef.current = null;
             }
@@ -1328,18 +2308,159 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
           const scorer = nextPlayers.find(p => p.id === ballState.lastTouchPlayerId) || null;
           registerGoal(scoringTeam, scorer);
         } else {
-          ballState.x = clamp(ballState.x, 0, 100);
-          ballState.vx = -ballState.vx * 0.34;
-          ballState.vy *= 0.68;
+          const lastTouchTeam = ballState.lastTouchTeam || scoringTeam;
+          const restartTeam = lastTouchTeam === scoringTeam ? getOppositeTeam(scoringTeam) : scoringTeam;
+          const restartType: MatchEventType = restartTeam === scoringTeam ? 'CORNER' : 'GOAL_KICK';
+          const restartLabel = restartType === 'CORNER' ? 'Korner' : 'Kale Vuruşu';
+          const restartPlayer = nextPlayers.find(p => p.id === ballState.lastTouchPlayerId);
+          const restartTaker = chooseSetPieceTaker(restartTeam, restartType);
+          const throughBallOutPattern = lastPassTypeRef.current === 'THROUGH_BALL' && restartType === 'GOAL_KICK';
+          if (throughBallOutPattern) {
+            const patternKey = 'THROUGH_BALL->GOAL_KICK';
+            const patternCount = matchStateRef.current.repeatedChainCounter[patternKey] || 0;
+            const mustAvoidGoalKick = patternCount >= 2;
+            const shouldChooseAlternative = mustAvoidGoalKick || rng.next() < 0.72;
+
+            if (shouldChooseAlternative) {
+              const alternativeRoll = Math.floor(rng.next() * 7);
+              const defendingPool = nextPlayers.filter(p => p.team === restartTeam);
+              const opponentPool = nextPlayers.filter(p => p.team !== scoringTeam && p.position !== 'GK');
+              const defender = findClosest(opponentPool.length ? opponentPool : defendingPool, clamp(ballState.x, FIELD_MIN_X, FIELD_MAX_X), clamp(ballState.y, PLAYER_MIN_Y, PLAYER_MAX_Y)).player;
+              const keeper = nextPlayers.find(p => p.team === restartTeam && p.position === 'GK') || defender;
+              const passerName = lastPasserNameRef.current || restartPlayer?.name || 'Pasör';
+
+              matchStateRef.current.repeatedChainCounter[patternKey] = patternCount + 1;
+              if (mustAvoidGoalKick) matchStateRef.current.chainCooldowns[patternKey] = tick + 620;
+
+              if (alternativeRoll === 0 && defender) {
+                ballState.x = clamp(defender.x, FIELD_MIN_X, FIELD_MAX_X);
+                ballState.y = clamp(defender.y, BALL_MIN_Y, BALL_MAX_Y);
+                ballState.z = 0;
+                ballState.vx = 0;
+                ballState.vy = 0;
+                ballState.vz = 0;
+                ballState.ownerId = defender.id;
+                ballState.lastTouchTeam = defender.team;
+                ballState.lastTouchPlayerId = defender.id;
+                ballPossessorIdRef.current = defender.id;
+                syncMatchState(defender.team, defender.id, ballState.x, ballState.y);
+                pushMatchEvent('INTERCEPTION', defender.team, defender.name, `${defender.name}, ${passerName} tarafından atılan ara pasa araya girerek müdahale etti.`, 'Araya Girme', { force: true, outcome: 'SUCCESS' });
+                pushMatchEvent('POSSESSION_CHANGE', defender.team, defender.name, `${getClubBySide(defender.team).shortName} araya giren savunma sonrası topu kontrol etti.`, 'Top El Değiştirdi', { force: true, outcome: 'SUCCESS' });
+                return;
+              }
+
+              if (alternativeRoll === 1 && keeper) {
+                ballState.x = clamp(keeper.x, FIELD_MIN_X, FIELD_MAX_X);
+                ballState.y = clamp(keeper.y, BALL_MIN_Y, BALL_MAX_Y);
+                ballState.z = 0;
+                ballState.vx = 0;
+                ballState.vy = 0;
+                ballState.vz = 0;
+                ballState.ownerId = keeper.id;
+                ballState.lastTouchTeam = keeper.team;
+                ballState.lastTouchPlayerId = keeper.id;
+                ballPossessorIdRef.current = keeper.id;
+                syncMatchState(keeper.team, keeper.id, ballState.x, ballState.y);
+                pushMatchEvent('KEEPER_CATCH', keeper.team, keeper.name, `${keeper.name} ceza sahası dışına doğru atılan ara pasa çıktı ve topu kontrol etti.`, 'Kaleci Kontrolü', { force: true, outcome: 'SUCCESS' });
+                pushMatchEvent('POSSESSION_CHANGE', keeper.team, keeper.name, `${getClubBySide(keeper.team).shortName} kaleci kontrolüyle oyunu sakinleştirdi.`, 'Top El Değiştirdi', { force: true, outcome: 'SUCCESS' });
+                return;
+              }
+
+              if (alternativeRoll === 2) {
+                stopForRestart(
+                  'OFFSIDE',
+                  restartTeam,
+                  clamp(ballState.x, FIELD_MIN_X, FIELD_MAX_X),
+                  clamp(ballState.y, BALL_MIN_Y, BALL_MAX_Y),
+                  restartPlayer?.name || passerName,
+                  `${passerName} savunma arkasına ara pası denedi, koşu ofsayta takıldı.`,
+                  'OFSAYT'
+                );
+                return;
+              }
+
+              if (alternativeRoll === 3) {
+                const throwTaker = chooseSetPieceTaker(restartTeam, 'THROW_IN');
+                stopForRestart(
+                  'THROW_IN',
+                  restartTeam,
+                  clamp(ballState.x, FIELD_MIN_X, FIELD_MAX_X),
+                  ballState.y > 50 ? BALL_MAX_Y : BALL_MIN_Y,
+                  throwTaker,
+                  `${passerName} ara pasında şiddeti ayarlayamadı, top taç çizgisini geçti. ${throwTaker} topu eline aldı.`,
+                  'TAÇ'
+                );
+                return;
+              }
+
+              if (alternativeRoll === 4 && defender) {
+                ballState.x = clamp(defender.x + (defender.team === 'home' ? 2 : -2), FIELD_MIN_X, FIELD_MAX_X);
+                ballState.y = clamp(defender.y, BALL_MIN_Y, BALL_MAX_Y);
+                ballState.ownerId = defender.id;
+                ballState.lastTouchTeam = defender.team;
+                ballState.lastTouchPlayerId = defender.id;
+                ballPossessorIdRef.current = defender.id;
+                syncMatchState(defender.team, defender.id, ballState.x, ballState.y);
+                pushMatchEvent('PASS_FAILED', scoringTeam, passerName, `${passerName} ara pasını fazla hızlı attı.`, 'Başarısız Pas', { force: true, outcome: 'FAILURE' });
+                pushMatchEvent('BALL_RECOVERY', defender.team, defender.name, `${defender.name} hızlanan topu kontrol edip takımını çıkardı.`, 'Top Kazanma', { force: true, outcome: 'SUCCESS' });
+                return;
+              }
+
+              if (alternativeRoll === 5 && defender) {
+                ballState.ownerId = defender.id;
+                ballState.lastTouchTeam = defender.team;
+                ballState.lastTouchPlayerId = defender.id;
+                ballPossessorIdRef.current = defender.id;
+                syncMatchState(defender.team, defender.id, defender.x, defender.y);
+                pushMatchEvent('CLEARANCE', defender.team, defender.name, `${defender.name} savunma arkasına atılan topu gelişine uzaklaştırdı.`, 'Uzaklaştırma', { force: true, outcome: 'SUCCESS' });
+                pushMatchEvent('LOOSE_BALL', defender.team, defender.name, 'Top orta sahada boşta kaldı.', 'Boşta Top', { force: true });
+                return;
+              }
+
+              if (defender) {
+                ballState.ownerId = defender.id;
+                ballState.lastTouchTeam = defender.team;
+                ballState.lastTouchPlayerId = defender.id;
+                ballPossessorIdRef.current = defender.id;
+                syncMatchState(defender.team, defender.id, defender.x, defender.y);
+                pushMatchEvent('TACKLE', defender.team, defender.name, `${defender.name} koşu yapan oyuncuya yetişip atağı kesti.`, 'Müdahale', { force: true, outcome: 'SUCCESS' });
+                pushMatchEvent('POSSESSION_CHANGE', defender.team, defender.name, `${getClubBySide(defender.team).shortName} müdahale sonrası topu kazandı.`, 'Top El Değiştirdi', { force: true, outcome: 'SUCCESS' });
+                return;
+              }
+            }
+
+            matchStateRef.current.repeatedChainCounter[patternKey] = patternCount + 1;
+          }
           if (tick - ballState.lastShotTick < 80) {
-            setLogs(prev => [...prev, `${Math.max(1, minuteRef.current)}' Şut az farkla dışarı gitti.`]);
+            const shotType: MatchEventType = rng.next() < 0.08 && Math.abs(ballState.y - 50) < 18 ? 'POST_HIT' : 'SHOT_OFF_TARGET';
+            pushMatchEvent(
+              shotType,
+              scoringTeam,
+              restartPlayer?.name || 'Şut',
+              shotType === 'POST_HIT' ? 'Top direkten oyun alanının dışına sekti.' : 'Şut az farkla dışarı gitti.',
+              shotType === 'POST_HIT' ? 'Direk' : 'İsabetsiz Şut',
+              { minGapTicks: 60 }
+            );
             ballState.lastShotTick = -999;
           }
+          stopForRestart(
+            restartType,
+            restartTeam,
+            scoringTeam === 'home' ? 94 : 6,
+            restartType === 'CORNER' ? (ballState.y > 50 ? 96 : 4) : 50,
+            restartTaker,
+            restartType === 'CORNER'
+              ? `Top savunmadan sekip çizgiyi geçti. ${restartTaker}, ${getClubBySide(scoringTeam).shortName} adına korneri hazırlıyor.`
+              : `Top auta çıktı. ${restartTaker} kale vuruşu için topu yerine koyuyor.`,
+            restartLabel
+          );
+          return;
         }
       }
 
       if (ballState.ownerId && ballState.lastTouchTeam === 'home') ballState.homePossTicks++;
       if (ballState.ownerId) ballState.totalPossTicks++;
+      syncMatchState(ballState.lastTouchTeam, ballState.ownerId, ballState.x, ballState.y);
       if (tick % 12 === 0 && ballState.totalPossTicks > 0) {
         setPossession(clamp((ballState.homePossTicks / ballState.totalPossTicks) * 100, 15, 85));
       }
@@ -1447,6 +2568,13 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
               setMatchDone(true);
               setShowMatchEndOverlay(true);
               setIsSimulating(false);
+              matchEventsRef.current.push({
+                minute: 90,
+                type: 'FULL_TIME',
+                teamId: homeClub.id,
+                playerName: 'Hakem',
+                detail: `${homeClub.name} ${homeScore} - ${awayScore} ${awayClub.name}. Son düdük çaldı.`
+              });
               setLogs(prev => [...prev, "ERSAN EFENDİ son düdüğü çalıyor! Maç sona erdi.", `Maç Sonucu: ${homeClub.name} ${homeScore} - ${awayScore} ${awayClub.name}`]);
               soundEngine.playMatchEnd();
               soundEngine.stopCrowd();
@@ -1459,8 +2587,25 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
               return 90;
             }
 
+            if (nextMin === 89) {
+              matchEventsRef.current.push({
+                minute: 89,
+                type: 'ADDED_TIME_ANNOUNCED',
+                teamId: homeClub.id,
+                playerName: 'Hakem',
+                detail: 'Dördüncü hakem uzatma süresini ilan etti.'
+              });
+            }
+
             // Half-time block
             if (nextMin === 45) {
+              matchEventsRef.current.push({
+                minute: 45,
+                type: 'HALF_TIME',
+                teamId: homeClub.id,
+                playerName: 'Hakem',
+                detail: 'İlk yarı sona erdi.'
+              });
               setLogs(prev => [...prev, "ERSAN EFENDİ ilk yarıyı bitiren düdüğü çalıyor. Devre arası.", `İlk Yarı Sonucu: ${homeClub.name} ${homeScore} - ${awayScore} ${awayClub.name}`]);
               setIsSimulating(false); // Pause at 45m for half-time break
               soundEngine.playMatchEnd();
@@ -1468,6 +2613,13 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
               soundEngine.playWhistle(true);
             }
             if (nextMin === 46) {
+              matchEventsRef.current.push({
+                minute: 46,
+                type: 'SECOND_HALF_START',
+                teamId: homeClub.id,
+                playerName: 'Hakem',
+                detail: 'İkinci yarı başladı.'
+              });
               setLogs(prev => [...prev, "ERSAN EFENDİ'nin işaretiyle ikinci yarı başladı! Bakalım antrenörlerin taktik hamleleri ne olacak."]);
               soundEngine.playMatchStart();
               if (matchViewMode === '3D') {
@@ -1477,9 +2629,8 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
             }
 
             // Live physics now drives goals and shots; the clock only adds occasional broadcast texture.
-            if (nextMin % 12 === 0 && nextMin !== 45) {
-              const randomNormal = rngRef.current.choice(COMMENTARY_TEMPLATES.COMMENT_NORMAL);
-              setLogs(prev => [...prev, `${nextMin}' ${randomNormal}`]);
+            if (nextMin % 3 === 0 && nextMin !== 45) {
+              emitAmbientFootballEvent(nextMin);
               soundEngine.playCommentaryTick();
             }
 
@@ -1672,15 +2823,24 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
       if (!culprit) return;
 
       const crimeChance = rng.next();
+      const freeKickTeam: TeamSide = isHomeCrime ? 'away' : 'home';
+      const freeKickTaker = chooseSetPieceTaker(freeKickTeam, 'FREE_KICK');
       if (crimeChance < 0.6) {
         // Yellow Card
         matchEventsRef.current.push({
           minute: currMin,
-          type: 'YELLOW',
+          type: 'YELLOW_CARD',
           teamId: isHomeCrime ? homeClub.id : awayClub.id,
           playerName: culprit.name
         });
         setLogs(prev => [...prev, `${currMin}' [Sarı Kart] - Hakem faul sebebiyle oyunu durduruyor ve ${culprit.name} (${isHomeCrime ? homeClub.shortName : awayClub.shortName}) sarı kart görüyor.`]);
+        pushSetPieceSequence(
+          'FREE_KICK',
+          freeKickTeam,
+          freeKickTaker,
+          `${culprit.name} faul yaptı. ${freeKickTaker}, ${getClubBySide(freeKickTeam).shortName} adına serbest vuruşu kullanacak.`,
+          'Serbest Vuruş'
+        );
 
         const culpritVisual = pitchPlayersRef.current.find(p => p.id === culprit.id);
         if (culpritVisual) {
@@ -1699,11 +2859,18 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         // Red Card !!! (Kırmızı Kart)
         matchEventsRef.current.push({
           minute: currMin,
-          type: 'RED',
+          type: 'RED_CARD',
           teamId: isHomeCrime ? homeClub.id : awayClub.id,
           playerName: culprit.name
         });
         setLogs(prev => [...prev, `${currMin}' [KIRMIZI KART!] - Çok sert bir müdahale! Hakem doğrudan kırmızı kart çıkarıyor ve ${culprit.name} (${isHomeCrime ? homeClub.shortName : awayClub.shortName}) oyundan ihraç ediliyor!`]);
+        pushSetPieceSequence(
+          'FREE_KICK',
+          freeKickTeam,
+          freeKickTaker,
+          `${culprit.name} çok sert girdi. ${freeKickTaker}, ${getClubBySide(freeKickTeam).shortName} adına serbest vuruşu kullanacak.`,
+          'Serbest Vuruş'
+        );
 
         const culpritVisual = pitchPlayersRef.current.find(p => p.id === culprit.id);
         if (culpritVisual) {
@@ -1772,7 +2939,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
       
       matchEventsRef.current.push({
         minute,
-        type: 'SUB',
+        type: 'SUBSTITUTION',
         teamId: isUserHome ? homeClub.id : awayClub.id,
         playerName: benchPlayer.name,
         detail: `${starterPlayer.name} yerine girdi.`
@@ -2005,6 +3172,14 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
               setPreMatchSetup(false);
               setCurrentMentality(isUserHome ? homeMentality : awayMentality);
               resetLivePhysics();
+              scorersRef.current = [];
+              matchEventsRef.current = [{
+                minute: 1,
+                type: 'KICK_OFF',
+                teamId: homeClub.id,
+                playerName: 'Hakem',
+                detail: `${homeClub.shortName} - ${awayClub.shortName} maçı başladı.`
+              }];
               const alignedPlayers = getInitialPositions(homeSquad, awaySquad, homeFormation, awayFormation);
               setPitchPlayers(alignedPlayers);
               prepareMatchPlan(matchSeed);
@@ -2292,70 +3467,68 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         </div>
       )}
 
-        {/* Real-time TV Match Finished Glowing Glass Overlay Popup */}
+        {/* Real-time TV Match Finished Overlay Popup */}
         {showMatchEndOverlay && (
-          <div className="absolute inset-0 bg-[#07080a]/92 backdrop-blur-md flex flex-col justify-center items-center p-4 sm:p-6 z-[100] animate-fade-in text-center select-none">
-            <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-indigo-500/10 via-transparent to-transparent pointer-events-none" />
+          <div className="absolute inset-0 bg-zinc-950/88 backdrop-blur-md flex flex-col justify-center items-center p-4 sm:p-6 z-[100] animate-fade-in text-center select-none">
+            <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_rgba(255,0,122,0.13),transparent_58%)] pointer-events-none" />
             
-            <div className="max-w-md w-full bg-zinc-50 border border-zinc-200 p-6 rounded-[28px] shrink-0 shadow-2xl relative z-10 space-y-4 animate-scale-up text-zinc-950">
+            <div className="max-w-md w-full bg-zinc-950/96 border border-zinc-800 p-5 sm:p-6 rounded-3xl shrink-0 shadow-2xl relative z-10 space-y-4 animate-scale-up text-zinc-100 overflow-hidden">
+              <div className="absolute inset-x-0 top-0 h-1 bg-[#FF007A]" />
               
               <div className="flex flex-col items-center space-y-1">
-                <div className="w-11 h-11 bg-amber-500/15 border border-amber-500/30 rounded-full flex items-center justify-center text-amber-500 shadow-md shadow-amber-500/5">
+                <div className="w-11 h-11 bg-[#FF007A]/12 border border-[#FF007A]/30 rounded-2xl flex items-center justify-center text-[#FF007A] shadow-md shadow-[#FF007A]/10">
                   <Trophy className="w-5.5 h-5.5 animate-bounce" style={{ animationDuration: '3.5s' }} />
                 </div>
-                <h2 className="text-lg font-black text-zinc-950 font-mono tracking-wider mt-1.5">MAÇ SONA ERDİ!</h2>
-                <p className="text-[10px] text-zinc-600 font-mono">DÜDÜK: <span className="text-emerald-700 font-black uppercase">ERSAN EFENDİ</span></p>
+                <h2 className="text-lg font-black text-zinc-100 font-mono tracking-wider mt-1.5">MAÇ SONA ERDİ</h2>
+                <p className="text-[10px] text-zinc-500 font-mono">DÜDÜK: <span className="text-emerald-400 font-black uppercase">ERSAN EFENDİ</span></p>
               </div>
 
-              {/* Glowing scoreboard row */}
-              <div className="flex items-center justify-between bg-white p-3.5 rounded-2xl border border-zinc-200 shadow-inner">
+              <div className="flex items-center justify-between bg-zinc-900/70 p-3.5 rounded-2xl border border-zinc-800 shadow-inner">
                 <div className="flex flex-col items-center flex-1 space-y-1">
                   <img src={homeClub.badge} alt={homeClub.name} className="w-9 h-9 object-contain" referrerPolicy="no-referrer" />
-                  <span className="text-[10px] font-black text-zinc-800 truncate max-w-[90px]">{homeClub.shortName}</span>
+                  <span className="text-[10px] font-black text-zinc-300 truncate max-w-[90px]">{homeClub.shortName}</span>
                 </div>
                 
                 <div className="flex flex-col items-center shrink-0 px-3">
                   <div className="flex items-center gap-3">
-                    <span className="text-2xl font-mono font-black text-zinc-950">{homeScore}</span>
-                    <span className="text-zinc-500 font-black text-base">-</span>
-                    <span className="text-2xl font-mono font-black text-zinc-950">{awayScore}</span>
+                    <span className="text-3xl font-mono font-black text-white">{homeScore}</span>
+                    <span className="text-zinc-600 font-black text-base">-</span>
+                    <span className="text-3xl font-mono font-black text-white">{awayScore}</span>
                   </div>
                   <span className="text-[8px] text-[#FF007A] uppercase font-black tracking-widest font-mono mt-0.5">90' FINAL RAPORU</span>
                 </div>
 
                 <div className="flex flex-col items-center flex-1 space-y-1">
                   <img src={awayClub.badge} alt={awayClub.name} className="w-9 h-9 object-contain" referrerPolicy="no-referrer" />
-                  <span className="text-[10px] font-black text-zinc-800 truncate max-w-[90px]">{awayClub.shortName}</span>
+                  <span className="text-[10px] font-black text-zinc-300 truncate max-w-[90px]">{awayClub.shortName}</span>
                 </div>
               </div>
 
-              {/* Scorers Section with Football symbol representation */}
               <div className="space-y-1 max-h-[105px] overflow-y-auto pr-1">
-                <p className="text-[9px] uppercase font-mono font-bold text-zinc-700 text-left pl-1">GOL ATANLAR</p>
+                <p className="text-[9px] uppercase font-mono font-bold text-zinc-500 text-left pl-1">GOL ATANLAR</p>
                 {scorersRef.current && scorersRef.current.length > 0 ? (
                   <div className="space-y-1">
                     {scorersRef.current.map((sc, idx) => (
-                      <div key={idx} className="flex justify-between items-center bg-white px-3 py-1 border border-zinc-200 rounded-xl text-[10px] text-zinc-800">
+                      <div key={idx} className="flex justify-between items-center bg-zinc-900 px-3 py-1.5 border border-zinc-800 rounded-xl text-[10px] text-zinc-200">
                         <span className="font-semibold flex items-center gap-1.5">
-                          <span className="text-emerald-600 text-[10px]">⚽</span> {sc.split(' (')[0]}
+                          <span className="text-emerald-400 text-[10px]">●</span> {sc.split(' (')[0]}
                         </span>
-                        <span className="font-mono text-[9px] text-zinc-600 font-bold">{sc.split(' (')[1]?.replace(')', '') || 'GOL'}</span>
+                        <span className="font-mono text-[9px] text-zinc-500 font-bold">{sc.split(' (')[1]?.replace(')', '') || 'GOL'}</span>
                       </div>
                     ))}
                   </div>
                 ) : (
-                  <div className="text-[10px] font-mono text-zinc-700 bg-white border border-zinc-200 py-2.5 rounded-xl text-center">
+                  <div className="text-[10px] font-mono text-zinc-400 bg-zinc-900 border border-zinc-800 py-2.5 rounded-xl text-center">
                     Bu karşılaşmada gol sesi çıkmadı.
                   </div>
                 )}
               </div>
 
-              {/* Actions */}
-              <div className="space-y-2 pt-2.5 border-t border-zinc-200">
+              <div className="space-y-2 pt-2.5 border-t border-zinc-800">
                 <button
                   type="button"
                   onClick={() => setShowMatchEndOverlay(false)}
-                  className="w-full py-2 bg-white hover:bg-zinc-100 border border-zinc-300 text-zinc-950 font-black text-[10px] sm:text-xs rounded-xl flex items-center justify-center gap-2 transition-all cursor-pointer shadow-md"
+                  className="w-full py-2 bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-zinc-100 font-black text-[10px] sm:text-xs rounded-xl flex items-center justify-center gap-2 transition-all cursor-pointer shadow-md"
                 >
                   <Eye className="w-3.5 h-3.5 text-[#FF007A]" />
                   SAHAYI İNCELE & TEKRAR SEYRET
@@ -2376,10 +3549,10 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
                       }
                     });
                   }}
-                  className="w-full py-2 bg-[#FF007A] hover:bg-[#FF007A]/95 text-white font-black text-[10px] sm:text-xs rounded-xl flex items-center justify-center gap-2 transition-all cursor-pointer shadow-lg shadow-[#FF007A]/15 scale-100 hover:scale-[1.01]"
+                  className="w-full py-2 bg-[#FF007A] hover:bg-[#ff1a8c] text-white font-black text-[10px] sm:text-xs rounded-xl flex items-center justify-center gap-2 transition-all cursor-pointer shadow-lg shadow-[#FF007A]/20 scale-100 hover:scale-[1.01]"
                 >
                   <CheckCircle2 className="w-3.5 h-3.5 text-white" />
-                  HAFTAYI TAMAMLA & OFİSE DÖN ➜
+                  HAFTAYI TAMAMLA & OFİSE DÖN
                 </button>
               </div>
 
