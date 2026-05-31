@@ -13,8 +13,10 @@ interface PitchPlayer {
   y: number; // percentage (0 - 100)
   rating: number;
   number: number;
-  restartAction?: 'THROW_IN';
+  restartAction?: RestartAction;
 }
+
+type RestartAction = 'THROW_IN' | 'CORNER' | 'FREE_KICK' | 'PENALTY' | 'GOAL_KICK';
 
 interface MiniPass {
   fromX: number;
@@ -162,12 +164,6 @@ export default function ThreeDPitch({
 
     if (hasControlledBall) {
       prevPropsBall.current = { ...ball };
-      ballPhysicsRef.current.x = c.x;
-      ballPhysicsRef.current.y = 0.235;
-      ballPhysicsRef.current.z = c.z;
-      ballPhysicsRef.current.vx = 0;
-      ballPhysicsRef.current.vy = 0;
-      ballPhysicsRef.current.vz = 0;
       return;
     }
 
@@ -1021,33 +1017,44 @@ export default function ThreeDPitch({
 
           const dribbleT = (pGroup.userData.animTime || 0) * 2.6;
           const footSide = Math.sin(dribbleT) >= 0 ? 1 : -1;
-          const touchPulse = Math.pow(Math.max(0, Math.sin(dribbleT * 2.0)), 1.7);
+          const touchPulse = Math.pow(Math.max(0, Math.sin(dribbleT * 1.65)), 1.5);
           const lateralX = dirZ;
           const lateralZ = -dirX;
-          const forwardTouch = 0.34 + touchPulse * 0.22 + Math.min(0.12, dirLen * 0.35);
-          const sideTouch = footSide * (0.11 + touchPulse * 0.05);
+          const forwardTouch = 0.38 + touchPulse * 0.12 + Math.min(0.1, dirLen * 0.28);
+          const sideTouch = footSide * (0.07 + touchPulse * 0.025);
           const desiredX = pGroup.position.x + dirX * forwardTouch + lateralX * sideTouch;
           const desiredZ = pGroup.position.z + dirZ * forwardTouch + lateralZ * sideTouch;
-          const nextX = b.x + (desiredX - b.x) * 0.5;
-          const nextZ = b.z + (desiredZ - b.z) * 0.5;
+          const ballGap = Math.hypot(desiredX - b.x, desiredZ - b.z);
+          const carryBlend = ballGap > 2.2 ? 0.72 : 0.18;
+          const nextX = b.x + (desiredX - b.x) * carryBlend;
+          const nextZ = b.z + (desiredZ - b.z) * carryBlend;
 
           b.vx = (nextX - b.x) / Math.max(delta, 0.016);
           b.vy = 0;
           b.vz = (nextZ - b.z) / Math.max(delta, 0.016);
           b.x = nextX;
-          b.y = 0.235 + touchPulse * 0.025;
+          b.y += (0.235 + touchPulse * 0.012 - b.y) * 0.35;
           b.z = nextZ;
           isHandledByPossessor = true;
         }
       }
 
       if (!isHandledByPossessor) {
-        const isThrowInSetup = fxStateVal?.type === 'NONE' && typeof fxStateVal.text === 'string' && fxStateVal.text.startsWith('TAÇ');
+        const restartPlayer = playersGroupRef.current?.children.find((child: any) =>
+          child instanceof THREE.Group && child.userData.restartAction
+        ) as THREE.Group | undefined;
+        const restartAction = restartPlayer?.userData.restartAction as RestartAction | undefined;
+        const isRestartSetup = fxStateVal?.type === 'NONE' && restartPlayer && restartAction;
 
-        if (isThrowInSetup) {
-          b.x += (targetVec.x - b.x) * 0.28;
-          b.z += (targetVec.z - b.z) * 0.28;
-          b.y += (1.68 - b.y) * 0.32;
+        if (isRestartSetup && restartPlayer) {
+          const isThrowIn = restartAction === 'THROW_IN';
+          const setPieceForward = restartPlayer.userData.team === 'home' ? 1 : -1;
+          const setupX = isThrowIn ? restartPlayer.position.x : targetVec.x;
+          const setupZ = isThrowIn ? restartPlayer.position.z + setPieceForward * 0.12 : targetVec.z;
+          const setupY = isThrowIn ? 1.66 : 0.245;
+          b.x += (setupX - b.x) * 0.3;
+          b.z += (setupZ - b.z) * 0.3;
+          b.y += (setupY - b.y) * 0.32;
           b.vx = 0;
           b.vy = 0;
           b.vz = 0;
@@ -1128,9 +1135,12 @@ export default function ThreeDPitch({
 
             const distToTarget = Math.hypot(targetX - pGroup.position.x, targetZ - pGroup.position.z);
 
-            // Interpolate position smoothly to remove teleport jumps
-            pGroup.position.x += (targetX - pGroup.position.x) * 0.12;
-            pGroup.position.z += (targetZ - pGroup.position.z) * 0.12;
+            const maxVisualStep = (pGroup.userData.restartAction ? 5.2 : 7.4) * delta;
+            if (distToTarget > 0.001) {
+              const visualStep = Math.min(distToTarget, maxVisualStep);
+              pGroup.position.x += ((targetX - pGroup.position.x) / distToTarget) * visualStep;
+              pGroup.position.z += ((targetZ - pGroup.position.z) / distToTarget) * visualStep;
+            }
 
             // Smooth yaw lookAt towards the ball Action
             const lookTarget = new THREE.Vector3(b.x, pGroup.position.y, b.z);
@@ -1148,9 +1158,10 @@ export default function ThreeDPitch({
             const leftArm = pGroup.getObjectByName('leftArm');
             const rightArm = pGroup.getObjectByName('rightArm');
 
-            const isMoving = distToTarget > 0.05;
-            const strideAmp = isMoving ? Math.min(0.68, distToTarget * 0.45) : 0.04; // low breathing motion when idle!
-            const animSpeed = isMoving ? (0.01 + Math.min(0.015, distToTarget * 0.005)) : 0.003;
+            const isMoving = distToTarget > 0.035;
+            const stepSpeed = isMoving ? Math.min(1.2, maxVisualStep / Math.max(delta, 0.016)) : 0;
+            const strideAmp = isMoving ? Math.min(0.62, 0.18 + stepSpeed * 0.055) : 0.04;
+            const animSpeed = isMoving ? (0.018 + Math.min(0.026, stepSpeed * 0.0026)) : 0.003;
 
             pGroup.userData.animTime = (pGroup.userData.animTime || 0) + delta * 60 * animSpeed * 10;
             const t = pGroup.userData.animTime;
@@ -1221,6 +1232,28 @@ export default function ThreeDPitch({
                   rightArm.rotation.z = 0.42;
                 }
                 if (head) head.rotation.x = -0.18;
+                return;
+              }
+
+              if (pGroup.userData.restartAction) {
+                const windup = 0.55 + Math.sin(t * 3.2) * 0.18;
+                if (leftLeg) {
+                  leftLeg.rotation.x = pGroup.userData.team === 'home' ? -0.2 : 0.2;
+                  leftLeg.position.y = 0.42;
+                }
+                if (rightLeg) {
+                  rightLeg.rotation.x = pGroup.userData.team === 'home' ? windup : -windup;
+                  rightLeg.position.y = 0.43;
+                }
+                if (leftArm) {
+                  leftArm.rotation.x = -0.18;
+                  leftArm.rotation.z = -0.34;
+                }
+                if (rightArm) {
+                  rightArm.rotation.x = 0.18;
+                  rightArm.rotation.z = 0.34;
+                }
+                if (head) head.rotation.x = -0.08;
                 return;
               }
 
