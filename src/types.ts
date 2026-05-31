@@ -60,6 +60,24 @@ export type MatchEventType =
   | 'SHORT_CORNER'
   | 'GOAL_KICK_AWARDED'
   | 'GOALKEEPER_PLACES_BALL'
+  | 'GOALKEEPER_POSITIONING'
+  | 'GOALKEEPER_TRACK_BALL'
+  | 'GOALKEEPER_CLOSE_ANGLE'
+  | 'GOALKEEPER_RUSH_OUT'
+  | 'GOALKEEPER_DIVE'
+  | 'GOALKEEPER_JUMP'
+  | 'GOALKEEPER_CATCH'
+  | 'GOALKEEPER_PARRY'
+  | 'GOALKEEPER_PUNCH'
+  | 'GOALKEEPER_TIP_OVER'
+  | 'GOALKEEPER_REFLEX_SAVE'
+  | 'GOALKEEPER_ONE_ON_ONE_SAVE'
+  | 'GOALKEEPER_PENALTY_DIVE'
+  | 'GOALKEEPER_CLAIM_CROSS'
+  | 'GOALKEEPER_MISJUDGE_CROSS'
+  | 'GOALKEEPER_DROP_BALL'
+  | 'GOALKEEPER_DISTRIBUTION_THROW'
+  | 'GOALKEEPER_DISTRIBUTION_KICK'
   | 'GOAL_KICK_TAKEN'
   | 'FREE_KICK_AWARDED'
   | 'PLAYER_STANDS_OVER_FREE_KICK'
@@ -80,8 +98,6 @@ export type MatchEventType =
   | 'REBOUND'
   | 'OWN_GOAL'
   | 'GOAL_DISALLOWED'
-  | 'KEEPER_CATCH'
-  | 'KEEPER_PUNCH'
   | 'KEEPER_ERROR'
   | 'ADVANTAGE_PLAYED'
   | 'HANDBALL'
@@ -193,6 +209,7 @@ export interface MatchEvent {
   teamId: string;
   teamSide?: 'home' | 'away';
   playerName: string;
+  player2Name?: string;
   detail?: string;
   commentary?: string;
   x?: number;

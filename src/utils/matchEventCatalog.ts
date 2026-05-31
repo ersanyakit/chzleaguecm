@@ -21,7 +21,7 @@ export interface MatchEventDefinition {
 }
 
 export const MATCH_EVENT_DEFINITIONS: MatchEventDefinition[] = [
-  { type: 'KICK_OFF', label: 'Santra', category: 'match_state', commentary: '{player} oyunu başlatıyor.' },
+  { type: 'KICK_OFF', label: 'Santra', category: 'match_state', commentary: '{player} santrayı {player2} ile başlatıyor.' },
   { type: 'HALF_TIME', label: 'Devre Arası', category: 'match_state', commentary: 'İlk yarı sona erdi.' },
   { type: 'SECOND_HALF_START', label: 'İkinci Yarı', category: 'match_state', commentary: 'İkinci yarı başladı.' },
   { type: 'FULL_TIME', label: 'Son Düdük', category: 'match_state', commentary: 'Maç sona erdi.' },
@@ -77,8 +77,24 @@ export const MATCH_EVENT_DEFINITIONS: MatchEventDefinition[] = [
   { type: 'OWN_GOAL', label: 'Kendi Kalesine', category: 'attack', commentary: '{player} ters bir dokunuş yaptı.' },
   { type: 'GOAL_DISALLOWED', label: 'Gol İptal', category: 'attack', commentary: 'Gol geçerli değil.' },
   { type: 'SAVE', label: 'Kurtarış', category: 'goalkeeper', commentary: '{player} kurtarışı yaptı.' },
-  { type: 'KEEPER_CATCH', label: 'Kaleci Tuttu', category: 'goalkeeper', commentary: '{player} topu kontrol etti.' },
-  { type: 'KEEPER_PUNCH', label: 'Yumruklama', category: 'goalkeeper', commentary: '{player} topu yumrukladı.' },
+  { type: 'GOALKEEPER_POSITIONING', label: 'Kaleci Pozisyonu', category: 'goalkeeper', commentary: '{player} pozisyon aldı.' },
+  { type: 'GOALKEEPER_TRACK_BALL', label: 'Top Takibi', category: 'goalkeeper', commentary: '{player} topu takip etti.' },
+  { type: 'GOALKEEPER_CLOSE_ANGLE', label: 'Açı Kapama', category: 'goalkeeper', commentary: '{player} açıyı kapattı.' },
+  { type: 'GOALKEEPER_RUSH_OUT', label: 'Öne Çıkış', category: 'goalkeeper', commentary: '{player} öne çıktı.' },
+  { type: 'GOALKEEPER_DIVE', label: 'Dalış', category: 'goalkeeper', commentary: '{player} uçarak hamle yaptı.' },
+  { type: 'GOALKEEPER_JUMP', label: 'Zıplama', category: 'goalkeeper', commentary: '{player} yükseldi.' },
+  { type: 'GOALKEEPER_CATCH', label: 'Yakalama', category: 'goalkeeper', commentary: '{player} topu iki eliyle tuttu.' },
+  { type: 'GOALKEEPER_PARRY', label: 'Çelme', category: 'goalkeeper', commentary: '{player} topu çeldi.' },
+  { type: 'GOALKEEPER_PUNCH', label: 'Yumruklama', category: 'goalkeeper', commentary: '{player} topu yumrukladı.' },
+  { type: 'GOALKEEPER_TIP_OVER', label: 'Üste Çelme', category: 'goalkeeper', commentary: '{player} topu üstten kornere çeldi.' },
+  { type: 'GOALKEEPER_REFLEX_SAVE', label: 'Refleks Kurtarış', category: 'goalkeeper', commentary: '{player} refleks kurtarışı yaptı.' },
+  { type: 'GOALKEEPER_ONE_ON_ONE_SAVE', label: 'Karşı Karşıya', category: 'goalkeeper', commentary: '{player} karşı karşıyada kurtardı.' },
+  { type: 'GOALKEEPER_PENALTY_DIVE', label: 'Penaltı Dalışı', category: 'goalkeeper', commentary: '{player} penaltıda köşeye uzandı.' },
+  { type: 'GOALKEEPER_CLAIM_CROSS', label: 'Orta Kontrolü', category: 'goalkeeper', commentary: '{player} ortayı aldı.' },
+  { type: 'GOALKEEPER_MISJUDGE_CROSS', label: 'Hatalı Çıkış', category: 'goalkeeper', commentary: '{player} ortada zamanlamayı kaçırdı.' },
+  { type: 'GOALKEEPER_DROP_BALL', label: 'Elden Kaçırma', category: 'goalkeeper', commentary: '{player} topu elinden kaçırdı.' },
+  { type: 'GOALKEEPER_DISTRIBUTION_THROW', label: 'Elle Oyun Kurma', category: 'goalkeeper', commentary: '{player} topu elle oyuna soktu.' },
+  { type: 'GOALKEEPER_DISTRIBUTION_KICK', label: 'Ayakla Oyun Kurma', category: 'goalkeeper', commentary: '{player} topu ayakla oyuna soktu.' },
   { type: 'KEEPER_ERROR', label: 'Kaleci Hatası', category: 'goalkeeper', commentary: '{player} hata yaptı.' },
   { type: 'FOUL', label: 'Faul', category: 'discipline', commentary: '{player} faul yaptı.' },
   { type: 'ADVANTAGE_PLAYED', label: 'Avantaj', category: 'discipline', commentary: 'Hakem avantajı oynattı.' },
@@ -116,8 +132,15 @@ export const getMatchEventDefinition = (type: MatchEventType) => DEFINITION_BY_T
 
 export const getMatchEventLabel = (type: MatchEventType) => DEFINITION_BY_TYPE[type]?.label || type;
 
-export const generateMatchCommentary = (type: MatchEventType, playerName: string, detail?: string) => {
+export const generateMatchCommentary = (
+  type: MatchEventType,
+  playerName: string,
+  detail?: string,
+  context: { player2Name?: string } = {}
+) => {
   if (detail) return detail;
   const template = DEFINITION_BY_TYPE[type]?.commentary || '{player} oyunun akışında rol aldı.';
-  return template.replace('{player}', playerName);
+  return template
+    .replaceAll('{player}', playerName)
+    .replaceAll('{player2}', context.player2Name || 'takım arkadaşı');
 };

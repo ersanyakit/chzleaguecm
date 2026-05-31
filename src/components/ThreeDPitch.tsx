@@ -13,10 +13,18 @@ interface PitchPlayer {
   y: number; // percentage (0 - 100)
   rating: number;
   number: number;
+  vx?: number;
+  vy?: number;
   restartAction?: RestartAction;
+  restartPhase?: RestartPhase;
+  goalkeeperAction?: GoalkeeperAnimationAction;
+  goalkeeperDirection?: GoalkeeperDirection;
 }
 
 type RestartAction = 'THROW_IN' | 'CORNER' | 'FREE_KICK' | 'PENALTY' | 'GOAL_KICK';
+type RestartPhase = 'SETUP' | 'RELEASE';
+type GoalkeeperAnimationAction = 'POSITION' | 'TRACK' | 'CLOSE_ANGLE' | 'RUSH' | 'DIVE' | 'JUMP' | 'CATCH' | 'PARRY' | 'PUNCH' | 'TIP' | 'DROP' | 'DISTRIBUTE';
+type GoalkeeperDirection = 'CENTER' | 'LEFT_LOW' | 'LEFT_HIGH' | 'RIGHT_LOW' | 'RIGHT_HIGH';
 
 interface MiniPass {
   fromX: number;
@@ -36,6 +44,8 @@ const getFormattedShortName = (fullName: string): string => {
   const initials = parts.slice(0, -1).map(p => p[0].toUpperCase() + '.').join(' ');
   return `${initials} ${parts[parts.length - 1].toUpperCase()}`;
 };
+
+const shortestAngleDelta = (from: number, to: number) => Math.atan2(Math.sin(to - from), Math.cos(to - from));
 
 interface ThreeDPitchProps {
   pitchPlayers: PitchPlayer[];
@@ -1044,20 +1054,46 @@ export default function ThreeDPitch({
           child instanceof THREE.Group && child.userData.restartAction
         ) as THREE.Group | undefined;
         const restartAction = restartPlayer?.userData.restartAction as RestartAction | undefined;
-        const isRestartSetup = fxStateVal?.type === 'NONE' && restartPlayer && restartAction;
+        const restartPhase = restartPlayer?.userData.restartPhase as RestartPhase | undefined;
+        const restartPhaseAge = restartPlayer ? performance.now() - (restartPlayer.userData.restartPhaseStartedAt || 0) : Infinity;
+        const isRestartSetup = restartPlayer && restartAction && (fxStateVal?.type === 'NONE' || restartPhase === 'RELEASE');
 
         if (isRestartSetup && restartPlayer) {
           const isThrowIn = restartAction === 'THROW_IN';
           const setPieceForward = restartPlayer.userData.team === 'home' ? 1 : -1;
-          const setupX = isThrowIn ? restartPlayer.position.x : targetVec.x;
-          const setupZ = isThrowIn ? restartPlayer.position.z + setPieceForward * 0.12 : targetVec.z;
-          const setupY = isThrowIn ? 1.66 : 0.245;
-          b.x += (setupX - b.x) * 0.3;
-          b.z += (setupZ - b.z) * 0.3;
-          b.y += (setupY - b.y) * 0.32;
-          b.vx = 0;
-          b.vy = 0;
-          b.vz = 0;
+          const releaseHold = isThrowIn && restartPhase === 'RELEASE' && restartPhaseAge < 260;
+          if (releaseHold || restartPhase !== 'RELEASE') {
+            const throwerAtLine = isThrowIn && Math.hypot(restartPlayer.position.x - targetVec.x, restartPlayer.position.z - targetVec.z) < 0.95;
+            const lateralToPitch = isThrowIn ? -Math.sign(restartPlayer.position.x || 1) : 0;
+            const releaseProgress = releaseHold ? Math.min(1, restartPhaseAge / 260) : 0;
+            const setupX = isThrowIn
+              ? restartPlayer.position.x + lateralToPitch * (0.2 + releaseProgress * 0.46)
+              : targetVec.x;
+            const setupZ = isThrowIn
+              ? restartPlayer.position.z + setPieceForward * (0.1 + releaseProgress * 0.22)
+              : targetVec.z;
+            const setupY = isThrowIn
+              ? (throwerAtLine || releaseHold ? 1.78 - releaseProgress * 0.36 : 0.32)
+              : 0.32;
+            b.x += (setupX - b.x) * (releaseHold ? 0.55 : 0.32);
+            b.z += (setupZ - b.z) * (releaseHold ? 0.55 : 0.32);
+            b.y += (setupY - b.y) * (releaseHold ? 0.55 : 0.32);
+            b.vx = 0;
+            b.vy = 0;
+            b.vz = 0;
+          } else {
+            const ballGravity = -18.5;
+            b.vy += ballGravity * delta;
+            const ballSpring = 14.8;
+            const ballDamp = 5.5;
+            const forceX = (targetVec.x - b.x) * ballSpring - b.vx * ballDamp;
+            const forceZ = (targetVec.z - b.z) * ballSpring - b.vz * ballDamp;
+            b.vx += forceX * delta;
+            b.vz += forceZ * delta;
+            b.x += b.vx * delta;
+            b.y += b.vy * delta;
+            b.z += b.vz * delta;
+          }
         } else {
           // Gravity acceleration dragging down
           const ballGravity = -18.5;
@@ -1130,27 +1166,38 @@ export default function ThreeDPitch({
         playersGroupRef.current.children.forEach((pGroup: any) => {
           if (pGroup instanceof THREE.Group) {
             // Retrieve target coordinates set by ticks and smoothly interpolate coordinate drift!
-            const targetX = pGroup.userData.targetX !== undefined ? pGroup.userData.targetX : pGroup.position.x;
-            const targetZ = pGroup.userData.targetZ !== undefined ? pGroup.userData.targetZ : pGroup.position.z;
+            const rawTargetX = pGroup.userData.targetX !== undefined ? pGroup.userData.targetX : pGroup.position.x;
+            const rawTargetZ = pGroup.userData.targetZ !== undefined ? pGroup.userData.targetZ : pGroup.position.z;
+            if (pGroup.userData.renderTargetX === undefined) pGroup.userData.renderTargetX = rawTargetX;
+            if (pGroup.userData.renderTargetZ === undefined) pGroup.userData.renderTargetZ = rawTargetZ;
+            const targetBlend = pGroup.userData.restartAction ? 0.2 : 0.34;
+            pGroup.userData.renderTargetX += (rawTargetX - pGroup.userData.renderTargetX) * targetBlend;
+            pGroup.userData.renderTargetZ += (rawTargetZ - pGroup.userData.renderTargetZ) * targetBlend;
+            const targetX = pGroup.userData.renderTargetX;
+            const targetZ = pGroup.userData.renderTargetZ;
 
             const distToTarget = Math.hypot(targetX - pGroup.position.x, targetZ - pGroup.position.z);
+            const isCarrier = ballPossessorIdRef.current === pGroup.name;
+            pGroup.userData.simSpeed = (pGroup.userData.simSpeed || 0) + ((pGroup.userData.targetSimSpeed || 0) - (pGroup.userData.simSpeed || 0)) * 0.18;
+            const simSpeed = pGroup.userData.simSpeed || 0;
+            const visualMaxSpeed = pGroup.userData.restartAction
+              ? 5.6
+              : isCarrier
+                ? Math.min(15.5, 8.8 + simSpeed * 0.85)
+                : Math.min(14.2, 7.4 + simSpeed * 0.65);
+            let visualStep = 0;
 
-            const maxVisualStep = (pGroup.userData.restartAction ? 5.2 : 7.4) * delta;
+            const maxVisualStep = visualMaxSpeed * delta;
             if (distToTarget > 0.001) {
-              const visualStep = Math.min(distToTarget, maxVisualStep);
+              visualStep = Math.min(distToTarget, maxVisualStep);
               pGroup.position.x += ((targetX - pGroup.position.x) / distToTarget) * visualStep;
               pGroup.position.z += ((targetZ - pGroup.position.z) / distToTarget) * visualStep;
             }
 
-            // Smooth yaw lookAt towards the ball Action
-            const lookTarget = new THREE.Vector3(b.x, pGroup.position.y, b.z);
-            const initialRotation = pGroup.rotation.clone();
-            pGroup.lookAt(lookTarget);
-            const targetRotY = pGroup.rotation.y;
-            pGroup.rotation.copy(initialRotation);
-
-            // Slerp rotation yaw splay
-            pGroup.rotation.y += (targetRotY - pGroup.rotation.y) * 0.12;
+            const moveAngle = Math.atan2(targetX - pGroup.position.x, targetZ - pGroup.position.z);
+            const ballAngle = Math.atan2(b.x - pGroup.position.x, b.z - pGroup.position.z);
+            const targetRotY = distToTarget > 0.18 ? moveAngle : ballAngle;
+            pGroup.rotation.y += shortestAngleDelta(pGroup.rotation.y, targetRotY) * 0.14;
 
             // Swinging active running legs and arms proportional to movement velocity!
             const leftLeg = pGroup.getObjectByName('leftLeg');
@@ -1159,16 +1206,26 @@ export default function ThreeDPitch({
             const rightArm = pGroup.getObjectByName('rightArm');
 
             const isMoving = distToTarget > 0.035;
-            const stepSpeed = isMoving ? Math.min(1.2, maxVisualStep / Math.max(delta, 0.016)) : 0;
-            const strideAmp = isMoving ? Math.min(0.62, 0.18 + stepSpeed * 0.055) : 0.04;
-            const animSpeed = isMoving ? (0.018 + Math.min(0.026, stepSpeed * 0.0026)) : 0.003;
+            const stepSpeed = isMoving ? visualStep / Math.max(delta, 0.016) : 0;
+            const targetStrideAmp = isMoving ? Math.min(0.78, 0.22 + stepSpeed * 0.048) : 0.035;
+            pGroup.userData.strideAmp = (pGroup.userData.strideAmp || 0) + (targetStrideAmp - (pGroup.userData.strideAmp || 0)) * 0.22;
+            const strideAmp = pGroup.userData.strideAmp;
+            const animSpeed = isMoving ? (0.03 + Math.min(0.065, stepSpeed * 0.0048)) : 0.003;
 
             pGroup.userData.animTime = (pGroup.userData.animTime || 0) + delta * 60 * animSpeed * 10;
             const t = pGroup.userData.animTime;
+            const setLegLift = (leg: THREE.Object3D | undefined, key: string, targetLift: number) => {
+              if (!leg) return;
+              const current = Number(leg.userData[key] || 0);
+              const next = current + (targetLift - current) * 0.24;
+              leg.userData[key] = Math.abs(next) < 0.001 ? 0 : next;
+              leg.position.y = 0.42 + leg.userData[key];
+            };
 
             // Reset base kinematic transforms
             pGroup.position.y = 0;
             pGroup.rotation.x = 0;
+            pGroup.rotation.z = 0;
             const head = pGroup.getObjectByName('head');
             if (head) head.rotation.x = 0;
 
@@ -1214,7 +1271,136 @@ export default function ThreeDPitch({
                 }
               }
             } else {
+              const goalkeeperAction = pGroup.userData.position === 'GK' ? pGroup.userData.goalkeeperAction as GoalkeeperAnimationAction | undefined : undefined;
+              const goalkeeperActionAge = goalkeeperAction ? now - (pGroup.userData.goalkeeperActionStartedAt || 0) : Infinity;
+              if (goalkeeperAction && goalkeeperActionAge < 1150) {
+                const direction = pGroup.userData.goalkeeperDirection as GoalkeeperDirection | undefined;
+                const side = direction?.startsWith('LEFT') ? -1 : direction?.startsWith('RIGHT') ? 1 : 0;
+                const progress = Math.min(1, goalkeeperActionAge / 720);
+                const diveLean = Math.sin(progress * Math.PI) * 0.78;
+
+                if (goalkeeperAction === 'DIVE' || goalkeeperAction === 'PARRY' || goalkeeperAction === 'TIP') {
+                  pGroup.rotation.z = -side * diveLean;
+                  pGroup.position.y = Math.sin(progress * Math.PI) * 0.34;
+                  if (leftArm) {
+                    leftArm.rotation.x = -Math.PI * 0.72;
+                    leftArm.rotation.z = side <= 0 ? -0.88 : -0.24;
+                  }
+                  if (rightArm) {
+                    rightArm.rotation.x = -Math.PI * 0.72;
+                    rightArm.rotation.z = side >= 0 ? 0.88 : 0.24;
+                  }
+                  if (leftLeg) leftLeg.rotation.x = -0.28;
+                  if (rightLeg) rightLeg.rotation.x = 0.28;
+                  return;
+                }
+
+                if (goalkeeperAction === 'JUMP' || goalkeeperAction === 'CATCH') {
+                  pGroup.position.y = Math.sin(progress * Math.PI) * 0.72;
+                  if (leftArm) {
+                    leftArm.rotation.x = -Math.PI * 0.82;
+                    leftArm.rotation.z = -0.28;
+                  }
+                  if (rightArm) {
+                    rightArm.rotation.x = -Math.PI * 0.82;
+                    rightArm.rotation.z = 0.28;
+                  }
+                  if (leftLeg) leftLeg.rotation.x = -0.14;
+                  if (rightLeg) rightLeg.rotation.x = 0.14;
+                  return;
+                }
+
+                if (goalkeeperAction === 'RUSH' || goalkeeperAction === 'CLOSE_ANGLE') {
+                  pGroup.rotation.x = pGroup.userData.team === 'home' ? -0.18 : 0.18;
+                  if (leftArm) {
+                    leftArm.rotation.x = -0.18;
+                    leftArm.rotation.z = -0.62;
+                  }
+                  if (rightArm) {
+                    rightArm.rotation.x = -0.18;
+                    rightArm.rotation.z = 0.62;
+                  }
+                  if (leftLeg) leftLeg.rotation.x = Math.sin(t * 1.4) * 0.42;
+                  if (rightLeg) rightLeg.rotation.x = -Math.sin(t * 1.4) * 0.42;
+                  return;
+                }
+
+                if (goalkeeperAction === 'PUNCH') {
+                  pGroup.position.y = Math.sin(progress * Math.PI) * 0.46;
+                  if (leftArm) leftArm.rotation.x = -Math.PI * 0.72;
+                  if (rightArm) rightArm.rotation.x = -Math.PI * 0.98;
+                  return;
+                }
+
+                if (goalkeeperAction === 'DROP') {
+                  if (head) head.rotation.x = 0.36;
+                  if (leftArm) leftArm.rotation.x = 0.36;
+                  if (rightArm) rightArm.rotation.x = 0.36;
+                  pGroup.position.y = -0.12;
+                  return;
+                }
+
+                if (goalkeeperAction === 'DISTRIBUTE') {
+                  if (leftArm) leftArm.rotation.x = -0.42;
+                  if (rightArm) rightArm.rotation.x = -1.05 + Math.sin(progress * Math.PI) * 0.42;
+                  if (rightLeg) rightLeg.rotation.x = Math.sin(progress * Math.PI) * 0.48;
+                  return;
+                }
+              }
+
               if (pGroup.userData.restartAction === 'THROW_IN') {
+                const restartPhase = pGroup.userData.restartPhase as RestartPhase | undefined;
+                const restartPhaseAge = now - (pGroup.userData.restartPhaseStartedAt || now);
+                const fieldFacing = Math.atan2(-pGroup.position.x, 0.01);
+                pGroup.rotation.y += shortestAngleDelta(pGroup.rotation.y, fieldFacing) * 0.28;
+
+                if (restartPhase === 'RELEASE') {
+                  const releaseProgress = Math.min(1, restartPhaseAge / 720);
+                  const armSwing = Math.sin(releaseProgress * Math.PI);
+                  pGroup.rotation.x = -0.08 - armSwing * 0.18;
+                  if (leftLeg) {
+                    leftLeg.rotation.x = 0.14;
+                    setLegLift(leftLeg, 'lift', 0);
+                  }
+                  if (rightLeg) {
+                    rightLeg.rotation.x = -0.22 - armSwing * 0.12;
+                    setLegLift(rightLeg, 'lift', 0.012 * armSwing);
+                  }
+                  if (leftArm) {
+                    leftArm.rotation.x = -Math.PI * (0.92 - releaseProgress * 0.34);
+                    leftArm.rotation.z = -0.36 + armSwing * 0.18;
+                  }
+                  if (rightArm) {
+                    rightArm.rotation.x = -Math.PI * (0.92 - releaseProgress * 0.34);
+                    rightArm.rotation.z = 0.36 - armSwing * 0.18;
+                  }
+                  if (head) head.rotation.x = -0.16 + armSwing * 0.1;
+                  return;
+                }
+
+                const throwReady = Math.hypot((pGroup.userData.targetX ?? pGroup.position.x) - pGroup.position.x, (pGroup.userData.targetZ ?? pGroup.position.z) - pGroup.position.z) < 0.95;
+                if (!throwReady) {
+                  const runAmp = Math.min(0.64, 0.24 + stepSpeed * 0.045);
+                  if (leftLeg) {
+                    leftLeg.rotation.x = Math.sin(t) * runAmp;
+                    setLegLift(leftLeg, 'lift', Math.max(0, Math.sin(t)) * 0.025);
+                  }
+                  if (rightLeg) {
+                    rightLeg.rotation.x = -Math.sin(t) * runAmp;
+                    setLegLift(rightLeg, 'lift', Math.max(0, -Math.sin(t)) * 0.025);
+                  }
+                  if (leftArm) {
+                    leftArm.rotation.x = -Math.sin(t) * runAmp * 0.55;
+                    leftArm.rotation.z = -0.18;
+                  }
+                  if (rightArm) {
+                    rightArm.rotation.x = Math.sin(t) * runAmp * 0.55;
+                    rightArm.rotation.z = 0.18;
+                  }
+                  if (head) head.rotation.x = 0;
+                  return;
+                }
+
                 if (leftLeg) {
                   leftLeg.rotation.x = 0.04;
                   leftLeg.position.y = 0.42;
@@ -1257,16 +1443,29 @@ export default function ThreeDPitch({
                 return;
               }
 
-              const isCarrier = ballPossessorIdRef.current === pGroup.name;
-              const dribbleKick = isCarrier ? Math.max(0, Math.sin(t * 2.6)) * 0.18 : 0;
+              if (isMoving && !pGroup.userData.restartAction) {
+                const targetLift = Math.abs(Math.sin(t * 1.08)) * Math.min(0.055, stepSpeed * 0.0055);
+                const targetLean = (pGroup.userData.team === 'home' ? -1 : 1) * Math.min(0.08, stepSpeed * 0.008);
+                pGroup.userData.bodyLift = (pGroup.userData.bodyLift || 0) + (targetLift - (pGroup.userData.bodyLift || 0)) * 0.18;
+                pGroup.userData.bodyLean = (pGroup.userData.bodyLean || 0) + (targetLean - (pGroup.userData.bodyLean || 0)) * 0.16;
+                pGroup.position.y = pGroup.userData.bodyLift;
+                pGroup.rotation.x = pGroup.userData.bodyLean;
+              } else {
+                pGroup.userData.bodyLift = (pGroup.userData.bodyLift || 0) * 0.82;
+                pGroup.userData.bodyLean = (pGroup.userData.bodyLean || 0) * 0.82;
+                pGroup.position.y = pGroup.userData.bodyLift;
+                pGroup.rotation.x = pGroup.userData.bodyLean;
+              }
+
+              const dribbleKick = isCarrier ? Math.max(0, Math.sin(t * 2.25)) * 0.11 : 0;
 
               if (leftLeg) {
                 leftLeg.rotation.x = Math.sin(t) * strideAmp + dribbleKick;
-                leftLeg.position.y = 0.42 + Math.max(0, Math.sin(t)) * 0.05 * (isMoving ? 1 : 0.2);
+                setLegLift(leftLeg, 'lift', Math.max(0, Math.sin(t)) * 0.026 * (isMoving ? 1 : 0.15));
               }
               if (rightLeg) {
-                rightLeg.rotation.x = -Math.sin(t) * strideAmp + (isCarrier ? Math.max(0, -Math.sin(t * 2.6)) * 0.18 : 0);
-                rightLeg.position.y = 0.42 + Math.max(0, -Math.sin(t)) * 0.05 * (isMoving ? 1 : 0.2);
+                rightLeg.rotation.x = -Math.sin(t) * strideAmp + (isCarrier ? Math.max(0, -Math.sin(t * 2.25)) * 0.09 : 0);
+                setLegLift(rightLeg, 'lift', Math.max(0, -Math.sin(t)) * 0.026 * (isMoving ? 1 : 0.15));
               }
               if (leftArm) {
                 leftArm.rotation.x = -Math.sin(t) * strideAmp * 0.72;
@@ -1568,7 +1767,14 @@ export default function ThreeDPitch({
         pGroup.userData.position = player.position;
         pGroup.userData.pNumber = player.number;
         pGroup.userData.name = player.name;
+        pGroup.userData.simSpeed = Math.hypot((player.vx || 0) * 0.37, (player.vy || 0) * 0.27);
+        pGroup.userData.targetSimSpeed = pGroup.userData.simSpeed;
         pGroup.userData.restartAction = player.restartAction;
+        pGroup.userData.restartPhase = player.restartPhase;
+        if (player.restartAction) pGroup.userData.restartPhaseStartedAt = performance.now();
+        pGroup.userData.goalkeeperAction = player.goalkeeperAction;
+        pGroup.userData.goalkeeperDirection = player.goalkeeperDirection;
+        if (player.goalkeeperAction) pGroup.userData.goalkeeperActionStartedAt = performance.now();
         playersGroup.add(pGroup);
       } else {
         // Set targets to slide smoothly inside the requestAnimationFrame loop
@@ -1578,7 +1784,20 @@ export default function ThreeDPitch({
         pGroup.userData.position = player.position;
         pGroup.userData.pNumber = player.number;
         pGroup.userData.name = player.name;
+        pGroup.userData.targetSimSpeed = Math.hypot((player.vx || 0) * 0.37, (player.vy || 0) * 0.27);
+        if (
+          player.restartAction &&
+          (player.restartAction !== pGroup.userData.restartAction || player.restartPhase !== pGroup.userData.restartPhase)
+        ) {
+          pGroup.userData.restartPhaseStartedAt = performance.now();
+        }
         pGroup.userData.restartAction = player.restartAction;
+        pGroup.userData.restartPhase = player.restartPhase;
+        if (player.goalkeeperAction && player.goalkeeperAction !== pGroup.userData.goalkeeperAction) {
+          pGroup.userData.goalkeeperActionStartedAt = performance.now();
+        }
+        pGroup.userData.goalkeeperAction = player.goalkeeperAction;
+        pGroup.userData.goalkeeperDirection = player.goalkeeperDirection;
       }
     });
 

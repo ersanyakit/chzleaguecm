@@ -3,6 +3,7 @@ import { Player, Tactics, Club, MatchEvent, MatchEventType, MatchState } from '.
 import { Play, Pause, Award, Activity, AlertCircle, RefreshCw, Sparkles, AlertTriangle, Tv, Grid3X3, Trophy, CheckCircle2, Eye, Volume2, VolumeX } from 'lucide-react';
 import { soundEngine } from '../utils/soundEngine';
 import { generateMatchCommentary, getMatchEventLabel } from '../utils/matchEventCatalog';
+import { GoalkeeperActionEvent, GoalkeeperDirection, GoalkeeperEngine } from '../utils/GoalkeeperEngine';
 import ThreeDPitch from './ThreeDPitch';
 import BroadcastBanner from './BroadcastBanner';
 
@@ -83,6 +84,8 @@ class SeededRandom {
 type TeamSide = 'home' | 'away';
 type GoalKind = 'OPEN_PLAY' | 'HEADER' | 'PENALTY' | 'FREE_KICK' | 'OWN_GOAL';
 type RestartAction = 'THROW_IN' | 'CORNER' | 'FREE_KICK' | 'PENALTY' | 'GOAL_KICK';
+type RestartPhase = 'SETUP' | 'RELEASE';
+type GoalkeeperAnimationAction = 'POSITION' | 'TRACK' | 'CLOSE_ANGLE' | 'RUSH' | 'DIVE' | 'JUMP' | 'CATCH' | 'PARRY' | 'PUNCH' | 'TIP' | 'DROP' | 'DISTRIBUTE';
 
 interface LivePitchPlayer {
   id: string;
@@ -102,6 +105,9 @@ interface LivePitchPlayer {
   actionCooldown: number;
   lastTouchTick: number;
   restartAction?: RestartAction;
+  restartPhase?: RestartPhase;
+  goalkeeperAction?: GoalkeeperAnimationAction;
+  goalkeeperDirection?: GoalkeeperDirection;
 }
 
 interface LiveBallState {
@@ -265,8 +271,20 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     type: MatchEventType;
     team: TeamSide;
     takerName: string;
+    receiverId?: string;
+    receiverName?: string;
     x: number;
     y: number;
+  } | null>(null);
+  const restartVisualRef = useRef<{ playerId: string; type: RestartAction; phase: RestartPhase; untilTick: number } | null>(null);
+  const kickoffIssuedRef = useRef(false);
+  const goalkeeperVisualRef = useRef<{
+    playerId: string;
+    firstAction: GoalkeeperAnimationAction;
+    secondAction: GoalkeeperAnimationAction;
+    direction: GoalkeeperDirection;
+    switchTick: number;
+    untilTick: number;
   } | null>(null);
   const queuedRestartGoalRef = useRef<PlannedGoal | null>(null);
   const pendingBallActionRef = useRef<{
@@ -369,7 +387,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     playerName: string,
     detail: string,
     label: string,
-    options: { minute?: number; minGapTicks?: number; sound?: boolean; log?: boolean; force?: boolean; outcome?: MatchEvent['outcome'] } = {}
+    options: { minute?: number; minGapTicks?: number; sound?: boolean; log?: boolean; force?: boolean; outcome?: MatchEvent['outcome']; metadata?: MatchEvent['metadata']; player2Name?: string } = {}
   ) => {
     const nowTick = liveTickRef.current;
     const gateKey = `${type}:${team}:${playerName}`;
@@ -393,7 +411,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
 
     eventGateRef.current[gateKey] = nowTick;
     const eventLabel = label || getMatchEventLabel(type);
-    const commentary = generateMatchCommentary(type, playerName, detail);
+    const commentary = generateMatchCommentary(type, playerName, detail, { player2Name: options.player2Name });
     if (!state.playerCooldowns[playerKey]) state.playerCooldowns[playerKey] = {};
     if (!state.teamCooldowns[teamKey]) state.teamCooldowns[teamKey] = {};
     state.playerCooldowns[playerKey][type] = nowTick + 95;
@@ -414,6 +432,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
       teamId: club.id,
       teamSide: team,
       playerName,
+      player2Name: options.player2Name,
       detail,
       commentary,
       x: ballSimRef.current.x,
@@ -424,7 +443,8 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         ballZone: state.ballZone,
         possessionTeamId: state.possessionTeamId,
         matchTempo: state.matchTempo,
-        repeatedChainCount: chainKey ? state.repeatedChainCounter[chainKey] || 0 : 0
+        repeatedChainCount: chainKey ? state.repeatedChainCounter[chainKey] || 0 : 0,
+        ...(options.metadata || {})
       }
     });
     if (options.log !== false) appendMatchLog(`${eventMinute}' [${eventLabel}] - ${commentary}`);
@@ -447,6 +467,116 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     const player = roster.length > 0 ? rngRef.current.choice(roster) : fallback;
     if (!player) return { name: 'Bilinmeyen Oyuncu', team, position: 'MID', rating: 60 };
     return { name: player.name, team, position: player.position, rating: player.rating };
+  };
+
+  const mapGoalkeeperAnimationAction = (type: MatchEventType): GoalkeeperAnimationAction => {
+    if (type === 'GOALKEEPER_POSITIONING') return 'POSITION';
+    if (type === 'GOALKEEPER_TRACK_BALL') return 'TRACK';
+    if (type === 'GOALKEEPER_CLOSE_ANGLE') return 'CLOSE_ANGLE';
+    if (type === 'GOALKEEPER_RUSH_OUT' || type === 'GOALKEEPER_ONE_ON_ONE_SAVE') return 'RUSH';
+    if (type === 'GOALKEEPER_DIVE' || type === 'GOALKEEPER_PENALTY_DIVE' || type === 'GOALKEEPER_REFLEX_SAVE') return 'DIVE';
+    if (type === 'GOALKEEPER_JUMP' || type === 'GOALKEEPER_CLAIM_CROSS') return 'JUMP';
+    if (type === 'GOALKEEPER_CATCH') return 'CATCH';
+    if (type === 'GOALKEEPER_PARRY') return 'PARRY';
+    if (type === 'GOALKEEPER_PUNCH') return 'PUNCH';
+    if (type === 'GOALKEEPER_TIP_OVER') return 'TIP';
+    if (type === 'GOALKEEPER_DROP_BALL' || type === 'GOALKEEPER_MISJUDGE_CROSS') return 'DROP';
+    if (type === 'GOALKEEPER_DISTRIBUTION_THROW' || type === 'GOALKEEPER_DISTRIBUTION_KICK') return 'DISTRIBUTE';
+    return 'TRACK';
+  };
+
+  const pushGoalkeeperActionEvent = (
+    keeper: LivePitchPlayer,
+    event: GoalkeeperActionEvent,
+    team: TeamSide,
+    force = false
+  ) => {
+    keeper.goalkeeperAction = mapGoalkeeperAnimationAction(event.type);
+    keeper.goalkeeperDirection = event.direction;
+    return pushMatchEvent(event.type, team, keeper.name, event.commentary, getMatchEventLabel(event.type), {
+      force,
+      minGapTicks: force ? undefined : 45,
+      metadata: {
+        goalkeeperId: event.goalkeeperId,
+        actionType: event.actionType,
+        direction: event.direction,
+        bodyMovement: event.bodyMovement,
+        handUsage: event.handUsage,
+        result: event.result,
+        reboundRisk: event.reboundRisk
+      }
+    });
+  };
+
+  const scheduleGoalkeeperActionSequence = (
+    keeper: LivePitchPlayer,
+    firstEvent: GoalkeeperActionEvent,
+    secondEvent: GoalkeeperActionEvent
+  ) => {
+    const nowTick = liveTickRef.current;
+    goalkeeperVisualRef.current = {
+      playerId: keeper.id,
+      firstAction: mapGoalkeeperAnimationAction(firstEvent.type),
+      secondAction: mapGoalkeeperAnimationAction(secondEvent.type),
+      direction: secondEvent.direction,
+      switchTick: nowTick + 8,
+      untilTick: nowTick + 22
+    };
+  };
+
+  const resolveGoalkeeperForAction = (
+    attackingTeam: TeamSide,
+    attackerName: string,
+    eventType: 'SHOT' | 'HEADER' | 'CROSS' | 'PENALTY',
+    shotX: number,
+    shotY: number,
+    targetX: number,
+    targetY: number,
+    power: number,
+    height: number,
+    pressure: number,
+    players: LivePitchPlayer[]
+  ) => {
+    const defendingTeam = getOppositeTeam(attackingTeam);
+    const keeper = players.find(p => p.team === defendingTeam && p.position === 'GK');
+    if (!keeper) return null;
+    const rosterKeeper = getRosterBySide(defendingTeam).find(p => p.id === keeper.id || p.name === keeper.name);
+    const shotDirection: GoalkeeperDirection =
+      targetY < 43 ? (height > 1.55 ? 'LEFT_HIGH' : 'LEFT_LOW') :
+      targetY > 57 ? (height > 1.55 ? 'RIGHT_HIGH' : 'RIGHT_LOW') :
+      'CENTER';
+    const baseGk = rosterKeeper?.goalkeeping || keeper.rating;
+    return {
+      keeper,
+      defendingTeam,
+      resolution: GoalkeeperEngine.resolveAction(
+        {
+          eventType,
+          shooterName: attackerName,
+          goalkeeperName: keeper.name,
+          shotPower: power,
+          shotAccuracy: clamp(100 - Math.abs(targetY - 50) * 2.2, 35, 98),
+          shotHeight: height,
+          shotDirection,
+          distanceToGoal: distance(shotX, shotY, attackingTeam === 'home' ? 100 : 0, 50),
+          goalkeeperPosition: keeper.y - targetY,
+          pressure,
+          fatigue: 100 - keeper.stamina,
+          weather: 'CLEAR',
+          seedRoll: rngRef.current.next()
+        },
+        {
+          reflex: baseGk,
+          diving: Math.round(baseGk * 0.68 + (rosterKeeper?.pace || keeper.rating) * 0.32),
+          handling: Math.round(baseGk * 0.72 + (rosterKeeper?.physical || keeper.rating) * 0.28),
+          aerialReach: Math.round(baseGk * 0.55 + (rosterKeeper?.physical || keeper.rating) * 0.45),
+          oneOnOne: Math.round(baseGk * 0.66 + (rosterKeeper?.morale || 70) * 0.34),
+          composure: Math.round(baseGk * 0.55 + (rosterKeeper?.form || 6) * 6)
+        },
+        matchStateRef.current,
+        keeper.id
+      )
+    };
   };
 
   const chooseSetPieceTaker = (team: TeamSide, type: 'THROW_IN' | 'CORNER' | 'FREE_KICK' | 'INDIRECT_FREE_KICK' | 'PENALTY' | 'GOAL_KICK') => {
@@ -618,8 +748,8 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
       { type: 'GOAL_LINE_CLEARANCE', team: defendingTeam, actor: defender.name, label: 'Çizgiden Çıkarma', detail: `${defender.name} kaleye giden topu çizgiden çıkardı.`, weight: 1 },
       { type: 'SAVE', team: defendingTeam, actor: keeper.name, label: 'Kurtarış', detail: `${keeper.name} gelen şutu iki hamlede kontrol etti.`, weight: 3 },
       { type: 'REFLEX_SAVE', team: defendingTeam, actor: keeper.name, label: 'Refleks', detail: `${keeper.name} yakın mesafede refleks kurtarışı yaptı.`, weight: 2 },
-      { type: 'KEEPER_PUNCH', team: defendingTeam, actor: keeper.name, label: 'Yumruklama', detail: `${keeper.name} ortayı yumruklayarak ceza sahasından uzaklaştırdı.`, weight: 2 },
-      { type: 'KEEPER_CATCH', team: defendingTeam, actor: keeper.name, label: 'Kaleci Kontrolü', detail: `${keeper.name} yüksek topu rahatça kontrol etti.`, weight: 3 },
+      { type: 'GOALKEEPER_PUNCH', team: defendingTeam, actor: keeper.name, label: 'Yumruklama', detail: `${keeper.name} ortayı yumruklayarak ceza sahasından uzaklaştırdı.`, weight: 2 },
+      { type: 'GOALKEEPER_CATCH', team: defendingTeam, actor: keeper.name, label: 'Kaleci Kontrolü', detail: `${keeper.name} yüksek topu rahatça kontrol etti.`, weight: 3 },
       { type: 'ONE_ON_ONE', team: attackingTeam, actor: attacker.name, label: 'Karşı Karşıya', detail: `${attacker.name} kaleciyle karşı karşıya kalacak boşluğu yakaladı.`, weight: 2 },
       { type: 'KEEPER_ERROR', team: defendingTeam, actor: keeper.name, label: 'Kaleci Hatası', detail: `${keeper.name} geri pasta kısa süreli panik yaşadı.`, weight: 1 },
       { type: 'CORNER', team: attackingTeam, actor: chooseSetPieceTaker(attackingTeam, 'CORNER'), label: 'Korner', detail: `${chooseSetPieceTaker(attackingTeam, 'CORNER')} korner için topun başına geçti.`, weight: 0 },
@@ -926,6 +1056,9 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     liveTickRef.current = 0;
     eventGateRef.current = {};
     pendingRestartRef.current = null;
+    restartVisualRef.current = null;
+    goalkeeperVisualRef.current = null;
+    kickoffIssuedRef.current = false;
     pendingBallActionRef.current = null;
     queuedRestartGoalRef.current = null;
     resetMatchFlowState();
@@ -993,10 +1126,13 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     phaseTicksRef.current = 0;
     pendingGoalRef.current = null;
     pendingShotRef.current = null;
-    pendingRestartRef.current = null;
-    pendingBallActionRef.current = null;
-    queuedRestartGoalRef.current = null;
-    lastPassTimeRef.current = 0;
+	    pendingRestartRef.current = null;
+	    pendingBallActionRef.current = null;
+	    queuedRestartGoalRef.current = null;
+	    restartVisualRef.current = null;
+	    goalkeeperVisualRef.current = null;
+	    kickoffIssuedRef.current = false;
+	    lastPassTimeRef.current = 0;
     lastPassTypeRef.current = null;
     lastPasserNameRef.current = null;
   };
@@ -1284,6 +1420,22 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         commentary: `${scorerName} ters bir dokunuşla topu kendi ağlarına gönderdi.`
       });
     }
+    const plannedGoalkeeperAction = resolveGoalkeeperForAction(
+      goal.team,
+      scorerName,
+      goal.kind === 'PENALTY' ? 'PENALTY' : goal.kind === 'HEADER' ? 'HEADER' : 'SHOT',
+      shotFrom.x,
+      shotFrom.y,
+      goalBallPosition.x,
+      goalBallPosition.y,
+      goal.kind === 'PENALTY' ? 82 : goal.kind === 'HEADER' ? 68 : 78,
+      goal.height,
+      48,
+      pitchPlayersRef.current
+    );
+    if (plannedGoalkeeperAction) {
+      pushGoalkeeperActionEvent(plannedGoalkeeperAction.keeper, plannedGoalkeeperAction.resolution.positioningEvent, plannedGoalkeeperAction.defendingTeam, true);
+    }
     matchEventsRef.current.push({
       minute: goalMinute,
       type: goal.kind === 'HEADER' ? 'HEADER' : 'SHOT',
@@ -1292,6 +1444,9 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
       playerName: scorerName,
       detail: goal.kind === 'HEADER' ? 'Kafa vuruşu kaleyi buldu.' : 'Gol öncesi şut çerçeveyi buldu.'
     });
+    if (plannedGoalkeeperAction) {
+      pushGoalkeeperActionEvent(plannedGoalkeeperAction.keeper, plannedGoalkeeperAction.resolution.reactionEvent, plannedGoalkeeperAction.defendingTeam, true);
+    }
     matchEventsRef.current.push({
       minute: goalMinute,
       type: 'BIG_CHANCE',
@@ -1411,10 +1566,10 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         }
       }
 
-      const resetForKickoff = () => {
-        ballState.x = 50;
-        ballState.y = 50;
-        ballState.z = 0;
+	      const resetForKickoff = () => {
+	        ballState.x = 50;
+	        ballState.y = 50;
+	        ballState.z = 0;
         ballState.vx = 0;
         ballState.vy = 0;
         ballState.vz = 0;
@@ -1425,12 +1580,84 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         activeAttackerIdRef.current = null;
         intendedReceiverIdRef.current = null;
         passerIdRef.current = null;
-        lastPassTypeRef.current = null;
-        lastPasserNameRef.current = null;
-        pendingRestartRef.current = null;
-        pendingBallActionRef.current = null;
-        setFxState(null);
-      };
+	        lastPassTypeRef.current = null;
+	        lastPasserNameRef.current = null;
+	        pendingRestartRef.current = null;
+	        restartVisualRef.current = null;
+	        goalkeeperVisualRef.current = null;
+	        pendingBallActionRef.current = null;
+	        if (!kickoffIssuedRef.current) {
+	          const kickoffTeam: TeamSide = 'home';
+	          const side = kickoffTeam === 'home' ? 1 : -1;
+	          const outfield = players.filter(p => p.team === kickoffTeam && p.position !== 'GK');
+	          const kickoffTaker = outfield
+	            .map(p => ({ p, d: distance(p.x, p.y, 50, 50) }))
+	            .sort((a, b) => a.d - b.d)[0]?.p || null;
+	          const kickoffReceiver = outfield
+	            .filter(p => p.id !== kickoffTaker?.id)
+	            .map(p => {
+	              const forwardLane = side * (p.x - 50);
+	              return {
+	                p,
+	                score: forwardLane * 2.4 - Math.abs(p.y - 50) * 0.55 - Math.abs(Math.abs(p.x - 50) - 11)
+	              };
+	            })
+	            .sort((a, b) => b.score - a.score)[0]?.p || null;
+
+	          if (kickoffTaker && kickoffReceiver) {
+	            kickoffTaker.x = 50;
+	            kickoffTaker.y = 50;
+	            kickoffTaker.vx = 0;
+	            kickoffTaker.vy = 0;
+	            kickoffTaker.heading = kickoffTeam === 'home' ? 0 : Math.PI;
+	            kickoffTaker.lastTouchTick = tick;
+	            kickoffTaker.actionCooldown = tick + 20;
+	            kickoffReceiver.x = clamp(50 + side * 10, FIELD_MIN_X, FIELD_MAX_X);
+	            kickoffReceiver.y = clamp(47 + (kickoffReceiver.number % 3) * 3, PLAYER_MIN_Y, PLAYER_MAX_Y);
+	            kickoffReceiver.vx = 0;
+	            kickoffReceiver.vy = 0;
+	            ballState.ownerId = kickoffTaker.id;
+	            ballState.lastTouchTeam = kickoffTeam;
+	            ballState.lastTouchPlayerId = kickoffTaker.id;
+	            ballState.looseUntilTick = tick + 18;
+	            ballPossessorIdRef.current = kickoffTaker.id;
+	            activeAttackerIdRef.current = kickoffTaker.id;
+	            intendedReceiverIdRef.current = kickoffReceiver.id;
+	            passerIdRef.current = kickoffTaker.id;
+	            passTicksRef.current = tick;
+	            pendingBallActionRef.current = {
+	              kind: 'PASS',
+	              kickerId: kickoffTaker.id,
+	              team: kickoffTeam,
+	              dueTick: tick + 6,
+	              targetX: kickoffReceiver.x,
+	              targetY: kickoffReceiver.y,
+	              power: 24,
+	              loft: 0.35,
+	              passType: 'PASS',
+	              receiverId: kickoffReceiver.id,
+	              receiverName: kickoffReceiver.name,
+	              eventLabel: 'Santra Pası',
+	              eventDetail: `${kickoffTaker.name} santradan ${kickoffReceiver.name} yönüne ileri pas oynadı.`,
+	              minute: Math.max(1, minuteRef.current)
+	            };
+	            pushMatchEvent(
+	              'KICK_OFF',
+	              kickoffTeam,
+	              kickoffTaker.name,
+	              `${kickoffTaker.name} santrayı ${kickoffReceiver.name} ile başlattı.`,
+	              'Santra',
+	              { force: true, player2Name: kickoffReceiver.name }
+	            );
+	            setPassingLines(prev => [
+	              ...prev,
+	              { fromX: 50, fromY: 50, toX: kickoffReceiver.x, toY: kickoffReceiver.y, time: Date.now() }
+	            ].slice(-5));
+	            kickoffIssuedRef.current = true;
+	          }
+	        }
+	        setFxState(null);
+	      };
 
       const resumePendingRestart = () => {
         const restart = pendingRestartRef.current;
@@ -1446,6 +1673,9 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
           players.find(p => p.team === restart.team && (restart.type === 'GOAL_KICK' ? p.position === 'GK' : p.position !== 'GK')) ||
           players.find(p => p.team === restart.team) ||
           null;
+        const restartReceiver = restart.receiverId
+          ? players.find(p => p.id === restart.receiverId) || null
+          : null;
         const restartSpot = {
           x: restart.type === 'PENALTY'
             ? (restart.team === 'home' ? 88 : 12)
@@ -1464,7 +1694,9 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
               : restart.type === 'PENALTY'
                 ? { x: restart.team === 'home' ? 101 : -1, y: clamp(queuedRestartGoalRef.current?.y ?? 50, GOAL_MIN_Y, GOAL_MAX_Y) }
                 : restart.type === 'THROW_IN'
-                  ? { x: clamp(restart.x + side * 14, FIELD_MIN_X, FIELD_MAX_X), y: clamp(50 + (restart.y - 50) * 0.35, BALL_MIN_Y, BALL_MAX_Y) }
+                  ? restartReceiver
+                    ? { x: clamp(restartReceiver.x, FIELD_MIN_X, FIELD_MAX_X), y: clamp(restartReceiver.y, BALL_MIN_Y, BALL_MAX_Y) }
+                    : { x: clamp(restart.x + side * 14, FIELD_MIN_X, FIELD_MAX_X), y: clamp(50 + (restart.y - 50) * 0.35, BALL_MIN_Y, BALL_MAX_Y) }
                   : { x: clamp(restart.x + side * 20, FIELD_MIN_X, FIELD_MAX_X), y: clamp(restart.y, BALL_MIN_Y, BALL_MAX_Y) };
         const dir = normalize(target.x - startX, target.y - startY);
         const power =
@@ -1481,7 +1713,28 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
           taker.restartAction = ['THROW_IN', 'CORNER', 'FREE_KICK', 'PENALTY', 'GOAL_KICK'].includes(restart.type)
             ? restart.type as RestartAction
             : undefined;
+          taker.restartPhase = restart.type === 'THROW_IN' ? 'RELEASE' : 'SETUP';
           taker.lastTouchTick = tick;
+        }
+        if (restart.type === 'THROW_IN' && taker && restartReceiver) {
+          restartVisualRef.current = {
+            playerId: taker.id,
+            type: 'THROW_IN',
+            phase: 'RELEASE',
+            untilTick: tick + 14
+          };
+          setPassingLines(prev => [
+            ...prev,
+            { fromX: startX, fromY: startY, toX: restartReceiver.x, toY: restartReceiver.y, time: Date.now() }
+          ].slice(-5));
+          pushMatchEvent(
+            'THROW_IN_TAKEN',
+            restart.team,
+            taker.name,
+            `${taker.name} taç atışını ${restartReceiver.name} yönüne kullandı.`,
+            'Taç Kullanıldı',
+            { force: true, minGapTicks: 0 }
+          );
         }
 
         ballState.x = clamp(startX + dir.x * 1.1, 0, 100);
@@ -1497,10 +1750,16 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         ballState.deadUntilTick = 0;
         ballPossessorIdRef.current = null;
         activeAttackerIdRef.current = null;
-        intendedReceiverIdRef.current = null;
-        passerIdRef.current = null;
+        intendedReceiverIdRef.current = restart.type === 'THROW_IN' ? restartReceiver?.id || null : null;
+        passerIdRef.current = taker?.id || null;
+        passTicksRef.current = tick;
         pendingRestartRef.current = null;
-        pitchPlayersRef.current = players.map(p => p.id === taker?.id ? { ...p, restartAction: undefined } : p);
+        pitchPlayersRef.current = players.map(p => p.id === taker?.id && restart.type === 'THROW_IN'
+          ? { ...p, restartAction: 'THROW_IN', restartPhase: 'RELEASE' }
+          : p.id === taker?.id
+            ? { ...p, restartAction: undefined, restartPhase: undefined }
+            : p
+        );
         syncMatchState(restart.team, null, ballState.x, ballState.y);
         setFxState(null);
       };
@@ -1532,13 +1791,31 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
               x: nextPos.x,
               y: nextPos.y,
               heading: restart.team === 'home' ? 0 : Math.PI,
-              restartAction
+              restartAction,
+              restartPhase: restartAction === 'THROW_IN' ? 'SETUP' : 'SETUP'
+            };
+          }
+          if (restart?.type === 'THROW_IN' && p.id === restart.receiverId) {
+            const side = restart.team === 'home' ? 1 : -1;
+            const receiveX = clamp(restart.x + side * 12, FIELD_MIN_X, FIELD_MAX_X);
+            const receiveY = clamp(restart.y < 50 ? 28 : 72, PLAYER_MIN_Y, PLAYER_MAX_Y);
+            const nextPos = moveTowards(p.x, p.y, receiveX, receiveY, 1.35);
+            return {
+              ...p,
+              vx: (nextPos.x - p.x) / TICK_SECONDS,
+              vy: (nextPos.y - p.y) / TICK_SECONDS,
+              x: nextPos.x,
+              y: nextPos.y,
+              heading: restart.team === 'home' ? 0 : Math.PI,
+              restartAction: undefined,
+              restartPhase: undefined
             };
           }
 
           return {
             ...p,
             restartAction: undefined,
+            restartPhase: undefined,
             vx: p.vx * 0.82,
             vy: p.vy * 0.82,
             x: p.x + (p.baseX - p.x) * 0.045,
@@ -1629,6 +1906,39 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         return { player: best, dist: bestDist };
       };
 
+      const chooseRestartReceiver = (
+        restartTeam: TeamSide,
+        restartKind: MatchEventType,
+        restartX: number,
+        restartY: number,
+        takerName: string
+      ) => {
+        if (restartKind !== 'THROW_IN') return null;
+        const side = restartTeam === 'home' ? 1 : -1;
+        const touchlineY = restartY < 50 ? PLAYER_MIN_Y : PLAYER_MAX_Y;
+        const preferredTarget = {
+          x: clamp(restartX + side * 12, FIELD_MIN_X, FIELD_MAX_X),
+          y: clamp(touchlineY < 50 ? 28 : 72, PLAYER_MIN_Y, PLAYER_MAX_Y)
+        };
+        return players
+          .filter(p => p.team === restartTeam && p.position !== 'GK' && p.name !== takerName)
+          .map(p => {
+            const distanceToThrow = distance(p.x, p.y, restartX, touchlineY);
+            const distanceToTarget = distance(p.x, p.y, preferredTarget.x, preferredTarget.y);
+            const forwardLane = side * (p.x - restartX);
+            const touchlineSupport = 100 - Math.abs(p.y - preferredTarget.y);
+            return {
+              p,
+              score:
+                distanceToTarget * 1.15 +
+                distanceToThrow * 0.42 -
+                Math.max(0, forwardLane) * 0.32 -
+                touchlineSupport * 0.03
+            };
+          })
+          .sort((a, b) => a.score - b.score)[0]?.p || null;
+      };
+
       const stopForRestart = (
         eventType: MatchEventType,
         restartTeam: TeamSide,
@@ -1655,6 +1965,8 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
           : restartKind === 'GOAL_KICK' || restartKind === 'PENALTY'
             ? 50
             : restartY;
+        const restartTakerName = eventType === 'OFFSIDE' ? chooseSetPieceTaker(restartTeam, 'FREE_KICK') : playerName;
+        const restartReceiver = chooseRestartReceiver(restartTeam, restartKind, visualRestartX, visualRestartY, restartTakerName);
 
         if (eventType === 'OFFSIDE') {
           pushMatchEvent('OFFSIDE', restartTeam, playerName, detail, label, { minGapTicks: 12 });
@@ -1665,7 +1977,9 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         pendingRestartRef.current = {
           type: restartKind,
           team: restartTeam,
-          takerName: eventType === 'OFFSIDE' ? chooseSetPieceTaker(restartTeam, 'FREE_KICK') : playerName,
+          takerName: restartTakerName,
+          receiverId: restartReceiver?.id,
+          receiverName: restartReceiver?.name,
           x: visualRestartX,
           y: visualRestartY
         };
@@ -1679,7 +1993,9 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         ballState.ownerId = null;
         ballState.lastTouchTeam = restartTeam;
         ballState.looseUntilTick = tick + 20;
-        ballState.deadUntilTick = tick + 34;
+        const takerForWait = players.find(p => p.team === restartTeam && p.name === restartTakerName);
+        const restartWalkDistance = takerForWait ? distance(takerForWait.x, takerForWait.y, visualRestartX, visualRestartY) : 0;
+        ballState.deadUntilTick = tick + Math.max(34, Math.min(110, Math.ceil(restartWalkDistance / 1.55) + 24));
         ballPossessorIdRef.current = null;
         pendingBallActionRef.current = null;
         activeAttackerIdRef.current = null;
@@ -1763,6 +2079,22 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         }
 
         if (pending.kind === 'SHOT') {
+          const gkAction = resolveGoalkeeperForAction(
+            kicker.team,
+            kicker.name,
+            'SHOT',
+            kicker.x,
+            kicker.y,
+            pending.targetX,
+            pending.targetY,
+            pending.power,
+            pending.loft,
+            100 - Math.min(100, kicker.stamina),
+            nextPlayers
+          );
+          if (gkAction) {
+            pushGoalkeeperActionEvent(gkAction.keeper, gkAction.resolution.positioningEvent, gkAction.defendingTeam, true);
+          }
           activeAttackerIdRef.current = kicker.id;
           shootTypeRef.current = 'GOAL';
           flightTargetRef.current = { x: kicker.team === 'home' ? 97 : 3, y: pending.targetY };
@@ -1776,10 +2108,41 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
             `${kicker.name} kaleyi gördü ve vuruşunu yaptı.`,
             'Şut',
             { minGapTicks: 55 }
-          );
+	          );
+	          if (gkAction) {
+	            pushGoalkeeperActionEvent(gkAction.keeper, gkAction.resolution.reactionEvent, gkAction.defendingTeam, true);
+	            if (gkAction.resolution.saveOrGoalResult.type !== gkAction.resolution.reactionEvent.type) {
+	              pushGoalkeeperActionEvent(gkAction.keeper, gkAction.resolution.saveOrGoalResult, gkAction.defendingTeam, true);
+	              scheduleGoalkeeperActionSequence(gkAction.keeper, gkAction.resolution.reactionEvent, gkAction.resolution.saveOrGoalResult);
+	            }
+	            if (gkAction.resolution.reboundEvent) {
+	              pushGoalkeeperActionEvent(gkAction.keeper, gkAction.resolution.reboundEvent, gkAction.defendingTeam, true);
+	            }
+	            if (gkAction.resolution.distributionEvent && gkAction.resolution.saveOrGoalResult.result === 'HELD') {
+	              pushGoalkeeperActionEvent(gkAction.keeper, gkAction.resolution.distributionEvent, gkAction.defendingTeam);
+	            }
+	          }
           kickBall(kicker, pending.targetX, pending.targetY, pending.power, pending.loft);
         } else {
           const receiver = nextPlayers.find(p => p.id === pending.receiverId) || null;
+          const gkAction = pending.passType === 'CROSS'
+            ? resolveGoalkeeperForAction(
+                kicker.team,
+                kicker.name,
+                'CROSS',
+                kicker.x,
+                kicker.y,
+                pending.targetX,
+                pending.targetY,
+                pending.power,
+                pending.loft,
+                38,
+                nextPlayers
+              )
+            : null;
+          if (gkAction) {
+            pushGoalkeeperActionEvent(gkAction.keeper, gkAction.resolution.positioningEvent, gkAction.defendingTeam, true);
+          }
           if (pending.passType) {
             pushMatchEvent(
               pending.passType,
@@ -1789,6 +2152,19 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
               pending.eventLabel,
               { minGapTicks: pending.passType === 'PASS' ? 90 : 70 }
             );
+	            if (gkAction) {
+	              pushGoalkeeperActionEvent(gkAction.keeper, gkAction.resolution.reactionEvent, gkAction.defendingTeam, true);
+	              if (gkAction.resolution.saveOrGoalResult.type !== gkAction.resolution.reactionEvent.type) {
+	                pushGoalkeeperActionEvent(gkAction.keeper, gkAction.resolution.saveOrGoalResult, gkAction.defendingTeam, true);
+	                scheduleGoalkeeperActionSequence(gkAction.keeper, gkAction.resolution.reactionEvent, gkAction.resolution.saveOrGoalResult);
+	              }
+	              if (gkAction.resolution.reboundEvent) {
+	                pushGoalkeeperActionEvent(gkAction.keeper, gkAction.resolution.reboundEvent, gkAction.defendingTeam, true);
+	              }
+	              if (gkAction.resolution.distributionEvent && gkAction.resolution.saveOrGoalResult.result === 'HELD') {
+	                pushGoalkeeperActionEvent(gkAction.keeper, gkAction.resolution.distributionEvent, gkAction.defendingTeam);
+	              }
+	            }
             lastPassTypeRef.current = pending.passType;
             lastPasserNameRef.current = kicker.name;
           }
@@ -1963,8 +2339,14 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
               `${currentOwner.name} ceza sahasında yerde kaldı, hakem penaltıyı verdi. Topun başına ${penaltyTaker} geçti; ${penaltyKeeper} köşeyi doğru tahmin edip vuruşu çıkardı.`,
               'PENALTI'
             );
+            const keeper = players.find(p => p.team === getOppositeTeam(currentOwner.team) && p.position === 'GK');
+            const gkAction = resolveGoalkeeperForAction(currentOwner.team, penaltyTaker, 'PENALTY', 88, 50, currentOwner.team === 'home' ? 101 : -1, 50, 78, 0.4, pressure, players);
+            if (keeper && gkAction) {
+              pushGoalkeeperActionEvent(gkAction.keeper, gkAction.resolution.positioningEvent, gkAction.defendingTeam, true);
+              pushGoalkeeperActionEvent(gkAction.keeper, gkAction.resolution.reactionEvent, gkAction.defendingTeam, true);
+            }
             pushMatchEvent(
-              'PENALTY_SAVE',
+              'GOALKEEPER_PENALTY_DIVE',
               getOppositeTeam(currentOwner.team),
               penaltyKeeper,
               `${penaltyKeeper}, ${penaltyTaker} tarafından kullanılan penaltıda köşeyi doğru tahmin edip topu çıkardı.`,
@@ -2084,6 +2466,12 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
 
       const liveOwner = ballState.ownerId ? players.find(p => p.id === ballState.ownerId) || null : null;
       const liveOwnerTeam = liveOwner?.team || ballState.lastTouchTeam;
+	      if (restartVisualRef.current && tick > restartVisualRef.current.untilTick) {
+	        restartVisualRef.current = null;
+	      }
+	      if (goalkeeperVisualRef.current && tick > goalkeeperVisualRef.current.untilTick) {
+	        goalkeeperVisualRef.current = null;
+	      }
       const looseChasers = new Set<string>();
       if (!liveOwner) {
         (['home', 'away'] as TeamSide[]).forEach(team => {
@@ -2092,11 +2480,28 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
           const sorted = players
             .filter(p => p.team === team && p.position !== 'GK')
             .map(p => ({ p, d: distance(p.x, p.y, ballState.x, ballState.y) }))
-            .sort((a, b) => a.d - b.d)
-            .slice(0, chaserCount);
-          sorted.forEach(item => looseChasers.add(item.p.id));
+            .sort((a, b) => a.d - b.d);
+          const nearestDistance = sorted[0]?.d ?? Infinity;
+          sorted
+            .filter(item => item.d <= nearestDistance + 7.5)
+            .slice(0, chaserCount)
+            .forEach(item => looseChasers.add(item.p.id));
         });
-        if (intendedReceiverIdRef.current) looseChasers.add(intendedReceiverIdRef.current);
+        if (intendedReceiverIdRef.current) {
+          const intendedReceiver = players.find(p => p.id === intendedReceiverIdRef.current) || null;
+          if (intendedReceiver) {
+            const sameTeamNearest = findClosest(
+              players.filter(p => p.team === intendedReceiver.team && p.position !== 'GK'),
+              ballState.x,
+              ballState.y
+            );
+            const receiverDistance = distance(intendedReceiver.x, intendedReceiver.y, ballState.x, ballState.y);
+            const activePassWindow = tick - passTicksRef.current <= 8;
+            if (receiverDistance <= sameTeamNearest.dist + 6 || activePassWindow) {
+              looseChasers.add(intendedReceiver.id);
+            }
+          }
+        }
       }
 
       const pressingChasers = new Set<string>();
@@ -2116,14 +2521,19 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
 
       let nextPlayers = players.map(p => {
         const side = p.team === 'home' ? 1 : -1;
-        const profile = getTacticalProfile(p.team);
-        let targetX = p.baseX;
-        let targetY = p.baseY;
-        let sprint = false;
+	        const profile = getTacticalProfile(p.team);
+	        let targetX = p.baseX;
+	        let targetY = p.baseY;
+	        let sprint = false;
+	        const activeRestartVisual = restartVisualRef.current?.playerId === p.id ? restartVisualRef.current : null;
 
-        if (p.position === 'GK') {
-          const ownGoalX = p.team === 'home' ? 5.2 : 94.8;
-          targetX = ownGoalX;
+	        if (activeRestartVisual?.type === 'THROW_IN') {
+	          targetX = p.x;
+	          targetY = p.y;
+	          sprint = false;
+	        } else if (p.position === 'GK') {
+	          const ownGoalX = p.team === 'home' ? 5.2 : 94.8;
+	          targetX = ownGoalX;
           const ballThreatensGoal = p.team === 'home' ? ballState.x < 25 : ballState.x > 75;
           targetY = ballThreatensGoal ? clamp(50 + (ballState.y - 50) * 0.46, 38, 62) : 50;
           if (!liveOwner && ballThreatensGoal && distance(p.x, p.y, ballState.x, ballState.y) < 12) {
@@ -2173,22 +2583,31 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         const accel = (sprint ? 8.5 : 5.6) + p.rating * 0.025;
         const desiredVx = toTarget.x * desiredSpeed;
         const desiredVy = toTarget.y * desiredSpeed;
-        const vx = p.vx + (desiredVx - p.vx) * clamp(accel * TICK_SECONDS, 0, 1);
-        const vy = p.vy + (desiredVy - p.vy) * clamp(accel * TICK_SECONDS, 0, 1);
-        const nextX = clamp(p.x + vx * TICK_SECONDS, FIELD_MIN_X, FIELD_MAX_X);
-        const nextY = clamp(p.y + vy * TICK_SECONDS, PLAYER_MIN_Y, PLAYER_MAX_Y);
-        const pinnedOutwardY = (nextY <= PLAYER_MIN_Y && vy < 0) || (nextY >= PLAYER_MAX_Y && vy > 0);
+	        const vx = p.vx + (desiredVx - p.vx) * clamp(accel * TICK_SECONDS, 0, 1);
+	        const vy = p.vy + (desiredVy - p.vy) * clamp(accel * TICK_SECONDS, 0, 1);
+	        const pinnedRestart = activeRestartVisual?.type === 'THROW_IN';
+	        const nextX = pinnedRestart ? p.x : clamp(p.x + vx * TICK_SECONDS, FIELD_MIN_X, FIELD_MAX_X);
+	        const nextY = pinnedRestart ? p.y : clamp(p.y + vy * TICK_SECONDS, PLAYER_MIN_Y, PLAYER_MAX_Y);
+	        const pinnedOutwardY = (nextY <= PLAYER_MIN_Y && vy < 0) || (nextY >= PLAYER_MAX_Y && vy > 0);
+	        const restartVisual = activeRestartVisual;
+	        const goalkeeperVisual = goalkeeperVisualRef.current?.playerId === p.id ? goalkeeperVisualRef.current : null;
+	        const sequencedGoalkeeperAction = goalkeeperVisual
+	          ? (tick < goalkeeperVisual.switchTick ? goalkeeperVisual.firstAction : goalkeeperVisual.secondAction)
+	          : p.goalkeeperAction;
 
-        return {
-          ...p,
+	        return {
+	          ...p,
           x: nextX,
           y: nextY,
-          vx: nextX === FIELD_MIN_X || nextX === FIELD_MAX_X ? 0 : vx,
-          vy: pinnedOutwardY ? 0 : vy,
-          heading: Math.abs(vx) + Math.abs(vy) > 0.02 ? Math.atan2(vy, vx) : p.heading,
-          restartAction: undefined,
-          stamina: clamp(p.stamina - (sprint ? 0.012 : 0.004), 45, 100)
-        };
+	          vx: pinnedRestart || nextX === FIELD_MIN_X || nextX === FIELD_MAX_X ? 0 : vx,
+	          vy: pinnedRestart || pinnedOutwardY ? 0 : vy,
+	          heading: Math.abs(vx) + Math.abs(vy) > 0.02 ? Math.atan2(vy, vx) : p.heading,
+	          restartAction: restartVisual?.type,
+	          restartPhase: restartVisual?.phase,
+	          goalkeeperAction: sequencedGoalkeeperAction,
+	          goalkeeperDirection: goalkeeperVisual?.direction || p.goalkeeperDirection,
+	          stamina: clamp(p.stamina - (sprint ? 0.012 : 0.004), 45, 100)
+	        };
       });
 
       let collisionCorrections = 0;
@@ -2287,6 +2706,19 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
           const isGoalkeeperSave = p.position === 'GK' && ((p.team === 'home' && ballState.x < 13) || (p.team === 'away' && ballState.x > 87));
 
           if (isGoalkeeperSave && d < 2.8 && looseSpeed > 18) {
+            const gkAction = resolveGoalkeeperForAction(
+              p.team === 'home' ? 'away' : 'home',
+              'Şut',
+              looseSpeed > 40 ? 'SHOT' : 'HEADER',
+              ballState.x,
+              ballState.y,
+              p.team === 'home' ? 0 : 100,
+              ballState.y,
+              looseSpeed,
+              ballState.z,
+              54,
+              nextPlayers
+            );
             const saveDir = p.team === 'home' ? 1 : -1;
             ballState.vx = saveDir * rng.range(34, 48);
             ballState.vy = rng.range(-20, 20);
@@ -2295,19 +2727,17 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
             ballState.lastTouchTeam = p.team;
             ballState.lastTouchPlayerId = p.id;
             p.lastTouchTick = tick;
-            const saveType: MatchEventType = looseSpeed > 44 ? 'REFLEX_SAVE' : rng.next() < 0.28 ? 'KEEPER_PUNCH' : 'SAVE';
-            pushMatchEvent(
-              saveType,
-              p.team,
-              p.name,
-              saveType === 'REFLEX_SAVE'
-                ? `${p.name} yakın mesafeden refleks kurtarışı yaptı.`
-                : saveType === 'KEEPER_PUNCH'
-                  ? `${p.name} sert gelen topu yumruklayarak uzaklaştırdı.`
-                  : `${p.name} kalede kritik bir kurtarış yaptı.`,
-              saveType === 'REFLEX_SAVE' ? 'Refleks' : saveType === 'KEEPER_PUNCH' ? 'Yumruklama' : 'Kurtarış',
-              { minGapTicks: 80 }
-            );
+	            if (gkAction) {
+	              pushGoalkeeperActionEvent(p, gkAction.resolution.positioningEvent, p.team, true);
+	              pushGoalkeeperActionEvent(p, gkAction.resolution.reactionEvent, p.team, true);
+	              if (gkAction.resolution.saveOrGoalResult.type !== gkAction.resolution.reactionEvent.type) {
+	                pushGoalkeeperActionEvent(p, gkAction.resolution.saveOrGoalResult, p.team, true);
+	                scheduleGoalkeeperActionSequence(p, gkAction.resolution.reactionEvent, gkAction.resolution.saveOrGoalResult);
+	              }
+	              if (gkAction.resolution.reboundEvent) {
+	                pushGoalkeeperActionEvent(p, gkAction.resolution.reboundEvent, p.team, true);
+	              }
+	            }
             break;
           }
 
@@ -2403,6 +2833,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
           const restartLabel = restartType === 'CORNER' ? 'Korner' : 'Kale Vuruşu';
           const restartPlayer = nextPlayers.find(p => p.id === ballState.lastTouchPlayerId);
           const restartTaker = chooseSetPieceTaker(restartTeam, restartType);
+          const lastTouchPrefix = restartPlayer ? `${restartPlayer.name} topa son dokunan oyuncu oldu. ` : '';
           const throughBallOutPattern = lastPassTypeRef.current === 'THROUGH_BALL' && restartType === 'GOAL_KICK';
           if (throughBallOutPattern) {
             const patternKey = 'THROUGH_BALL->GOAL_KICK';
@@ -2450,7 +2881,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
                 ballState.lastTouchPlayerId = keeper.id;
                 ballPossessorIdRef.current = keeper.id;
                 syncMatchState(keeper.team, keeper.id, ballState.x, ballState.y);
-                pushMatchEvent('KEEPER_CATCH', keeper.team, keeper.name, `${keeper.name} ceza sahası dışına doğru atılan ara pasa çıktı ve topu kontrol etti.`, 'Kaleci Kontrolü', { force: true, outcome: 'SUCCESS' });
+                pushMatchEvent('GOALKEEPER_CATCH', keeper.team, keeper.name, `${keeper.name} ceza sahası dışına doğru atılan ara pasa çıktı ve topu kontrol etti.`, 'Kaleci Kontrolü', { force: true, outcome: 'SUCCESS' });
                 pushMatchEvent('POSSESSION_CHANGE', keeper.team, keeper.name, `${getClubBySide(keeper.team).shortName} kaleci kontrolüyle oyunu sakinleştirdi.`, 'Top El Değiştirdi', { force: true, outcome: 'SUCCESS' });
                 return;
               }
@@ -2539,8 +2970,8 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
             restartType === 'CORNER' ? (ballState.y > 50 ? 96 : 4) : 50,
             restartTaker,
             restartType === 'CORNER'
-              ? `Top savunmadan sekip çizgiyi geçti. ${restartTaker}, ${getClubBySide(scoringTeam).shortName} adına korneri hazırlıyor.`
-              : `Top auta çıktı. ${restartTaker} kale vuruşu için topu yerine koyuyor.`,
+              ? `${lastTouchPrefix}Top savunmadan sekip çizgiyi geçti. ${restartTaker}, ${getClubBySide(scoringTeam).shortName} adına korneri hazırlıyor.`
+              : `${lastTouchPrefix}Top auta çıktı. ${restartTaker} kale vuruşu için topu yerine koyuyor.`,
             restartLabel
           );
           return;
