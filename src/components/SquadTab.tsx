@@ -7,9 +7,18 @@ interface SquadTabProps {
   transferBudget: number;
   onUpdateSquad: (updatedSquad: Player[]) => void;
   onSellPlayer?: (player: Player) => void;
+  onNotify?: (title: string, message: string, variant?: 'info' | 'success' | 'warning' | 'danger') => void;
+  onRequestConfirm?: (dialog: {
+    title: string;
+    message: string;
+    variant?: 'info' | 'success' | 'warning' | 'danger';
+    confirmLabel?: string;
+    cancelLabel?: string;
+    onConfirm: () => void;
+  }) => void;
 }
 
-export default function SquadTab({ squad, transferBudget, onUpdateSquad, onSellPlayer }: SquadTabProps) {
+export default function SquadTab({ squad, transferBudget, onUpdateSquad, onSellPlayer, onNotify, onRequestConfirm }: SquadTabProps) {
   const [selectedPlayer, setSelectedPlayer] = useState<Player | null>(null);
 
   // Toggle starting status
@@ -18,7 +27,7 @@ export default function SquadTab({ squad, transferBudget, onUpdateSquad, onSellP
     if (!player.isStarting) {
       const activeStartersCount = squad.filter(p => p.isStarting).length;
       if (activeStartersCount >= 11) {
-        alert("En fazla 11 oyuncu ilk 11'de başlayabilir. Lütfen önce bir oyuncuyu yedeğe çekin.");
+        onNotify?.('İlk 11 Dolu', "En fazla 11 oyuncu ilk 11'de başlayabilir. Lütfen önce bir oyuncuyu yedeğe çekin.", 'warning');
         return;
       }
     }
@@ -157,7 +166,7 @@ export default function SquadTab({ squad, transferBudget, onUpdateSquad, onSellP
     });
 
     onUpdateSquad(updatedRoster);
-    alert("Otomatik İlk 11 dengeli formasyona (4-4-2) göre en formda ve sağlıklı oyuncularınızla dolduruldu!");
+    onNotify?.('İlk 11 Hazır', "Otomatik İlk 11 dengeli formasyona göre en formda ve sağlıklı oyuncularınızla dolduruldu.", 'success');
   };
 
   return (
@@ -405,10 +414,16 @@ export default function SquadTab({ squad, transferBudget, onUpdateSquad, onSellP
               {onSellPlayer && (
                 <button
                   onClick={() => {
-                    if(confirm(`${selectedPlayer.name} isimli oyuncuyu transfer listesine koymak istiyor musunuz?`)) {
+                    onRequestConfirm?.({
+                      title: 'Oyuncuyu Satışa Koy',
+                      message: `${selectedPlayer.name} isimli oyuncuyu transfer listesine koymak istiyor musunuz?`,
+                      variant: 'warning',
+                      confirmLabel: 'Satışa Koy',
+                      onConfirm: () => {
                       onSellPlayer(selectedPlayer);
                       setSelectedPlayer(null);
-                    }
+                      }
+                    });
                   }}
                   className="w-full mt-2 py-2 rounded-xl text-xs font-semibold border border-red-900/40 text-rose-400 bg-red-950/20 hover:bg-red-950/40 transition-all flex items-center justify-center gap-1.5"
                 >

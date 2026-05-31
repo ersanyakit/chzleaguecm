@@ -198,7 +198,7 @@ div[class*="rounded-full bg-zinc-950 border-2"] {
 /* Custom Scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
-  height: 60px;
+  height: 6px;
 }
 
 ::-webkit-scrollbar-track {

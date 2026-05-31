@@ -7,6 +7,15 @@ interface TransferTabProps {
   squad: Player[];
   onBuyPlayer: (player: Player) => void;
   onSellPlayer: (player: Player) => void;
+  onNotify?: (title: string, message: string, variant?: 'info' | 'success' | 'warning' | 'danger') => void;
+  onRequestConfirm?: (dialog: {
+    title: string;
+    message: string;
+    variant?: 'info' | 'success' | 'warning' | 'danger';
+    confirmLabel?: string;
+    cancelLabel?: string;
+    onConfirm: () => void;
+  }) => void;
 }
 
 // Pre-seeded high quality global players in transfer market pool
@@ -23,7 +32,7 @@ const MARKET_PLAYERS_INITIAL: Player[] = [
   { id: "tm_10", name: "John Smith", age: 31, position: "GK", rating: 73, pace: 35, shooting: 10, passing: 55, defending: 20, physical: 70, goalkeeping: 74, value: 1600000, wage: 8000, form: 6, fitness: 100, morale: 75, injuryWeeks: 0, goals: 0, assists: 0, appearances: 0, yellowCards: 0, redCards: 0, ratingHistory: [], avgRating: 0, isStarting: false, pitchPosition: 0, isCaptain: false, isPenaltyTaker: false },
 ];
 
-export default function TransferTab({ transferBudget, squad, onBuyPlayer, onSellPlayer }: TransferTabProps) {
+export default function TransferTab({ transferBudget, squad, onBuyPlayer, onSellPlayer, onNotify, onRequestConfirm }: TransferTabProps) {
   const [filterPos, setFilterPos] = useState<'ALL' | 'GK' | 'DEF' | 'MID' | 'ATT'>('ALL');
   const [marketPlayers, setMarketPlayers] = useState<Player[]>(MARKET_PLAYERS_INITIAL);
   const [searchQuery, setSearchQuery] = useState('');
@@ -31,36 +40,42 @@ export default function TransferTab({ transferBudget, squad, onBuyPlayer, onSell
 
   const handleBuy = (player: Player) => {
     if (transferBudget < player.value) {
-      alert("Yetersiz Transfer Bütçesi! Kulüp bütçesi bu oyuncuyu almaya elverişli değil.");
+      onNotify?.('Bütçe Yetersiz', 'Kulüp bütçesi bu oyuncuyu almaya elverişli değil.', 'warning');
       return;
     }
 
     if (squad.length >= 25) {
-      alert("Kadro doldu! Kadronuzda en fazla 25 oyuncu barındırabilirsiniz. Lütfen önce bir oyuncu satın.");
+      onNotify?.('Kadro Dolu', 'Kadronuzda en fazla 25 oyuncu barındırabilirsiniz. Lütfen önce bir oyuncu satın.', 'warning');
       return;
     }
 
-    if (confirm(`${player.name} isimli oyuncuyu transfer etmek istiyor musunuz? Değeri: ${formatMoney(player.value)}`)) {
+    onRequestConfirm?.({
+      title: 'Transferi Onayla',
+      message: `${player.name} isimli oyuncuyu transfer etmek istiyor musunuz?\n\nDeğer: ${formatMoney(player.value)}`,
+      variant: 'warning',
+      confirmLabel: 'Sözleşme İmzala',
+      onConfirm: () => {
       onBuyPlayer({ ...player, id: 'buy_' + Math.random().toString(36).substr(2, 9) });
       setBoughtPlayerIds([...boughtPlayerIds, player.id]);
       setMarketPlayers(marketPlayers.filter(p => p.id !== player.id));
-      alert(`${player.name} kulübümüze başarıyla katıldı! Hoş geldin şampiyon.`);
-    }
+      onNotify?.('Transfer Tamamlandı', `${player.name} kulübümüze katıldı.`, 'success');
+      }
+    });
   };
 
   const handleSell = (player: Player) => {
     if (squad.length <= 15) {
-      alert("Kadro çok daralıyor! Ligde oynamak için kadronuzda en az 15 oyuncu olmak zorundadır.");
+      onNotify?.('Kadro Çok Dar', 'Ligde oynamak için kadronuzda en az 15 oyuncu olmak zorundadır.', 'warning');
       return;
     }
 
     if (player.isStarting) {
-      alert("İlk 11 oyuncusu satılamaz! Lütfen önce oyuncuyu yedeklere çekin.");
+      onNotify?.('İlk 11 Oyuncusu Satılamaz', 'Lütfen önce oyuncuyu yedeklere çekin.', 'warning');
       return;
     }
 
     onSellPlayer(player);
-    alert(`${player.name} kulüpten ayrıldı. ${formatMoney(player.value)} bütçeye eklendi.`);
+    onNotify?.('Oyuncu Satıldı', `${player.name} kulüpten ayrıldı. ${formatMoney(player.value)} bütçeye eklendi.`, 'success');
   };
 
   const formatMoney = (val: number) => {

@@ -9,32 +9,60 @@ import InboxTab from './components/InboxTab';
 import TrainingTab from './components/TrainingTab';
 import MatchEngine from './components/MatchEngine';
 import DebugTab from './components/DebugTab';
-import { Trophy, Mail as MailIcon, Dumbbell, Shield, ArrowUpDown, Swords, Play, Sparkles, AlertCircle, RefreshCw, ShoppingBag, Landmark, Cpu } from 'lucide-react';
+import { Trophy, Mail as MailIcon, Dumbbell, Shield, ArrowUpDown, Swords, Play, Sparkles, AlertCircle, RefreshCw, ShoppingBag, Landmark, Cpu, ArrowLeft } from 'lucide-react';
 
 const STORAGE_KEY = 'CM_RETRO_GAME_STATE_v2';
 
-// Safe alert/confirm overrides to prevent iframe/sandboxed environment SecurityError exceptions
-if (typeof window !== 'undefined') {
-  const nativeAlert = window.alert;
-  const nativeConfirm = window.confirm;
+type AppDialog = {
+  title: string;
+  message: string;
+  variant?: 'info' | 'success' | 'warning' | 'danger';
+  confirmLabel?: string;
+  cancelLabel?: string;
+  onConfirm?: () => void;
+};
 
-  window.alert = function (message?: any) {
-    try {
-      nativeAlert(message);
-    } catch (e) {
-      console.warn("window.alert is blocked in sandboxed iframe. Message:", message);
-    }
-  };
+const DEFAULT_TACTICS: Tactics = {
+  formation: '4-4-2',
+  mentality: 'BALANCED',
+  style: 'TIKI_TAKA',
+  tempo: 'NORMAL',
+  passing: 'MIXED'
+};
 
-  window.confirm = function (message?: string): boolean {
-    try {
-      return nativeConfirm(message);
-    } catch (e) {
-      console.warn("window.confirm is blocked in sandboxed iframe. Defaulting to true. Message:", message);
-      return true;
-    }
-  };
+const getUnixSeed = () => Math.floor(Date.now() / 1000);
+
+class AppSeededRandom {
+  private seed: number;
+
+  constructor(seed: number) {
+    this.seed = seed || 1;
+  }
+
+  next(): number {
+    let t = this.seed += 0x6D2B79F5;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+
+  range(min: number, max: number): number {
+    return min + this.next() * (max - min);
+  }
+
+  choice<T>(arr: T[]): T {
+    return arr[Math.floor(this.next() * arr.length)];
+  }
 }
+
+const hashSeed = (input: string) => {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+};
 
 export default function App() {
   // Load existing session synchronously to prevent race conditions on mount
@@ -68,12 +96,9 @@ export default function App() {
   const [fixtures, setFixtures] = useState<Fixture[]>(savedState?.fixtures || []);
   const [standings, setStandings] = useState<LeagueStanding[]>(savedState?.standings || []);
   const [inbox, setInbox] = useState<Mail[]>(savedState?.inbox || []);
-  const [tactics, setTactics] = useState<Tactics>(savedState?.tactics || {
-    formation: '4-4-2',
-    mentality: 'BALANCED',
-    style: 'TIKI_TAKA',
-    tempo: 'NORMAL',
-    passing: 'MIXED'
+  const [tactics, setTactics] = useState<Tactics>({
+    ...DEFAULT_TACTICS,
+    ...(savedState?.tactics || {})
   });
   const [trainingAllocation, setTrainingAllocation] = useState<TrainingAllocation>(savedState?.trainingAllocation || {
     fitness: 20,
@@ -88,6 +113,7 @@ export default function App() {
   
   // Live Match Screen Controller
   const [activeMatchFixture, setActiveMatchFixture] = useState<Fixture | null>(null);
+  const [appDialog, setAppDialog] = useState<AppDialog | null>(null);
 
   // General gossip news ticker
   const [gossipFeed, setGossipFeed] = useState<Array<{tag: string, title: string}>>([
@@ -184,7 +210,75 @@ export default function App() {
     fetchGossip();
   }, [week, isLobby, managedTeamId]);
 
-  const [matchSeedSeed, setMatchSeedSeed] = useState<number>(1780083284);
+  const [matchSeedSeed, setMatchSeedSeed] = useState<number>(savedState?.matchSeedSeed || getUnixSeed());
+
+  const showNotice = (title: string, message: string, variant: AppDialog['variant'] = 'info') => {
+    setAppDialog({ title, message, variant, confirmLabel: 'Tamam' });
+  };
+
+  const requestConfirmation = (dialog: AppDialog & { onConfirm: () => void }) => {
+    setAppDialog({
+      cancelLabel: 'Vazgeç',
+      confirmLabel: 'Onayla',
+      variant: 'warning',
+      ...dialog
+    });
+  };
+
+  const renderAppDialog = () => {
+    if (!appDialog) return null;
+
+    const variantClass = appDialog.variant === 'danger'
+      ? 'text-rose-400 bg-rose-500/10 border-rose-500/30'
+      : appDialog.variant === 'success'
+        ? 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30'
+        : appDialog.variant === 'warning'
+          ? 'text-amber-400 bg-amber-500/10 border-amber-500/30'
+          : 'text-[#FF007A] bg-[#FF007A]/10 border-[#FF007A]/30';
+
+    return (
+      <div className="fixed inset-0 z-[300] bg-[#07080A]/85 backdrop-blur-sm flex items-center justify-center p-4 animate-fade-in">
+        <div className="w-full max-w-md bg-zinc-950 border border-zinc-800 rounded-[28px] shadow-2xl p-5 sm:p-6 space-y-4">
+          <div className="flex items-start gap-3">
+            <div className={`w-10 h-10 rounded-2xl border flex items-center justify-center shrink-0 ${variantClass}`}>
+              <AlertCircle className="w-5 h-5" />
+            </div>
+            <div className="min-w-0">
+              <h3 className="text-sm sm:text-base font-black text-zinc-100 tracking-wide">{appDialog.title}</h3>
+              <p className="text-xs sm:text-sm text-zinc-400 leading-relaxed mt-1 whitespace-pre-line">{appDialog.message}</p>
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-2 pt-2 border-t border-zinc-900">
+            {appDialog.onConfirm && (
+              <button
+                type="button"
+                onClick={() => setAppDialog(null)}
+                className="px-4 py-2 rounded-xl border border-zinc-800 bg-zinc-900 text-zinc-300 hover:text-white hover:bg-zinc-800 text-xs font-black transition-colors"
+              >
+                {appDialog.cancelLabel || 'Vazgeç'}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                const onConfirm = appDialog.onConfirm;
+                setAppDialog(null);
+                onConfirm?.();
+              }}
+              className={`px-4 py-2 rounded-xl text-white text-xs font-black transition-all shadow-lg ${
+                appDialog.variant === 'danger'
+                  ? 'bg-rose-600 hover:bg-rose-500 shadow-rose-500/10'
+                  : 'bg-[#FF007A] hover:bg-[#ff1a8c] shadow-[#FF007A]/15'
+              }`}
+            >
+              {appDialog.confirmLabel || 'Tamam'}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   // Handle Game Initialization
   const handleStartGame = (chosenTeamId: string) => {
@@ -256,13 +350,8 @@ export default function App() {
       fixtures: generatedFixt,
       standings: initialStandings,
       inbox: welcomeInbox,
-      tactics: {
-        formation: '4-4-2',
-        mentality: 'BALANCED',
-        style: 'TIKI_TAKA',
-        tempo: 'NORMAL',
-        passing: 'MIXED'
-      },
+      tactics: DEFAULT_TACTICS,
+      matchSeedSeed,
       trainingAllocation: {
         fitness: 20,
         tactical: 20,
@@ -288,12 +377,18 @@ export default function App() {
 
   // Auto Reset state
   const handleResetSave = () => {
-    if (confirm("Bu sezondaki tüm ilerlemeniz sıfırlanacaktır. Emin misiniz?")) {
+    requestConfirmation({
+      title: 'Sezonu Sıfırla',
+      message: 'Bu sezondaki tüm ilerlemeniz sıfırlanacaktır. Bu işlem kayıtlı sezonu kaldırır.',
+      variant: 'danger',
+      confirmLabel: 'Sezonu Sıfırla',
+      onConfirm: () => {
       localStorage.removeItem(STORAGE_KEY);
       setIsLobby(true);
       setManagedTeamId('');
       setWeek(1);
-    }
+      }
+    });
   };
 
   const handleUpdateSquad = (updated: Player[]) => {
@@ -311,6 +406,11 @@ export default function App() {
     // Total allocation must sum to 100%
     setTrainingAllocation(updated);
     saveStateToStorage({ trainingAllocation: updated });
+  };
+
+  const handleMatchSeedChange = (seed: number) => {
+    setMatchSeedSeed(seed);
+    saveStateToStorage({ matchSeedSeed: seed });
   };
 
   // Purchasing transfers
@@ -349,6 +449,7 @@ export default function App() {
 
   // Sub fixture action generator (speed auto simulate on other non-user games)
   const simulateAiMatch = (homeId: string, awayId: string): { homeScore: number; awayScore: number; scorers: string[] } => {
+    const rng = new AppSeededRandom(matchSeedSeed + week * 1009 + hashSeed(`${homeId}:${awayId}`));
     const homeSquadList = squads[homeId] || [];
     const awaySquadList = squads[awayId] || [];
     const homeClubOvr = homeSquadList.length > 0 ? Math.round(homeSquadList.reduce((acc, p) => acc + (p.rating || 65), 0) / homeSquadList.length) : 70;
@@ -357,23 +458,22 @@ export default function App() {
     const homeStrength = homeClubOvr + 4; // home advantage
     const awayStrength = awayClubOvr;
 
-    const baseChance = Math.random() * 100;
     let homeScore = 0;
     let awayScore = 0;
 
     const diff = homeStrength - awayStrength; // -20 to +20 range
     
     // Simple Gaussian-style scores projection
-    const goalProb = Math.random();
+    const goalProb = rng.next();
     if (goalProb < 0.2) {
-      homeScore = Math.floor(Math.random() * 2);
-      awayScore = Math.floor(Math.random() * 2);
+      homeScore = Math.floor(rng.range(0, 2));
+      awayScore = Math.floor(rng.range(0, 2));
     } else if (goalProb < 0.6) {
-      homeScore = Math.floor(Math.random() * 3) + (diff > 5 ? 1 : 0);
-      awayScore = Math.floor(Math.random() * 2) + (diff < -5 ? 1 : 0);
+      homeScore = Math.floor(rng.range(0, 3)) + (diff > 5 ? 1 : 0);
+      awayScore = Math.floor(rng.range(0, 2)) + (diff < -5 ? 1 : 0);
     } else {
-      homeScore = Math.floor(Math.random() * 4) + (diff > 8 ? 2 : 0);
-      awayScore = Math.floor(Math.random() * 3) + (diff < -8 ? 2 : 0);
+      homeScore = Math.floor(rng.range(0, 4)) + (diff > 8 ? 2 : 0);
+      awayScore = Math.floor(rng.range(0, 3)) + (diff < -8 ? 2 : 0);
     }
 
     // Map randomized scorer rosters
@@ -382,12 +482,12 @@ export default function App() {
     const scorers: string[] = [];
 
     for (let i = 0; i < homeScore; i++) {
-      const player = homeSqr[Math.floor(Math.random() * homeSqr.length)];
-      if (player) scorers.push(`${Math.floor(Math.random() * 88) + 1}'. ${player.name}`);
+      const player = homeSqr[Math.floor(rng.range(0, homeSqr.length))];
+      if (player) scorers.push(`${Math.floor(rng.range(1, 89))}'. ${player.name}`);
     }
     for (let i = 0; i < awayScore; i++) {
-      const player = awaySqr[Math.floor(Math.random() * awaySqr.length)];
-      if (player) scorers.push(`${Math.floor(Math.random() * 88) + 1}'. ${player.name}`);
+      const player = awaySqr[Math.floor(rng.range(0, awaySqr.length))];
+      if (player) scorers.push(`${Math.floor(rng.range(1, 89))}'. ${player.name}`);
     }
 
     return { homeScore, awayScore, scorers };
@@ -403,7 +503,11 @@ export default function App() {
     if (!userMatch && teams.length > 0) {
       const isSeasonCompleted = Number(week) > Number(totalWeeks);
       if (isSeasonCompleted) {
-        alert("🏆 Tebrikler Sayın Menajer! Harika bir sezonu geride bıraktınız. Lig tablosundaki performansınız tescillenmiştir.\n\nKulüp yönetim kurulu ve taraftarlar yeni sezon heyecanını şimdiden hissederken; mevcut bütçeniz ve kadro yapınız korunarak yeni sezon fikstürü hazırlanıyor! ⚽");
+        showNotice(
+          'Sezon Tamamlandı',
+          'Tebrikler Sayın Menajer. Harika bir sezonu geride bıraktınız. Lig tablosundaki performansınız tescillendi.\n\nKulüp yönetim kurulu ve taraftarlar yeni sezon heyecanını hissederken mevcut bütçeniz ve kadro yapınız korunarak yeni sezon fikstürü hazırlanıyor.',
+          'success'
+        );
       } else {
         console.warn("Self-healing: No active fixture found for managed team. Healing schedule mismatch...");
       }
@@ -469,12 +573,12 @@ export default function App() {
     }
 
     if (!userMatch) {
-      alert("Bu hafta için aktif bir fikstür eşleşmeniz bulunmuyor. Lütfen sonraki tura ilerleyin veya 'Taktikler' / 'Kadro' düzenleyerek devam edin!");
+      showNotice('Fikstür Bulunamadı', "Bu hafta için aktif bir fikstür eşleşmeniz bulunmuyor. Sonraki tura ilerleyin veya 'Taktikler' / 'Kadro' düzenleyerek devam edin.", 'warning');
       return;
     }
 
     if (userMatch.played) {
-      alert("Bu haftaki maçınızı zaten tamamladınız! Yeni haftaya ilerlemek için 'Gelen Kutusu' veya yönetim panellerini takip edin.");
+      showNotice('Maç Zaten Tamamlandı', "Bu haftaki maçınızı zaten tamamladınız. Yeni haftaya ilerlemek için 'Gelen Kutusu' veya yönetim panellerini takip edin.", 'info');
       return;
     }
 
@@ -592,7 +696,7 @@ export default function App() {
         ? `Kadronuzda tam 11 oyuncu seçilmemişti (${activeStartersCount}/11 oyuncu seçili).`
         : `Kadronuzda sakat durumunda ilk 11 oyuncusu bulunuyordu (${injuredStartersCount} sakat oyuncu).`;
 
-      alert(`${explanation}\n\nEn yüksek güce sahip ve sağlıklı oyuncularınız otomatik olarak ilk 11'e yerleştirildi ve maça geçiliyor!`);
+      showNotice('İlk 11 Otomatik Düzenlendi', `${explanation}\n\nEn yüksek güce sahip ve sağlıklı oyuncularınız otomatik olarak ilk 11'e yerleştirildi ve maça geçiliyor.`, 'info');
     }
 
     setActiveMatchFixture(userMatch);
@@ -606,6 +710,8 @@ export default function App() {
     events: any[];
     stats: any;
   }) => {
+    const weekRng = new AppSeededRandom(matchSeedSeed + week * 4099 + hashSeed(managedTeamId));
+
     // 1. Record completed scoreboard in our fixtures array
     const weekFix = fixtures.filter(f => Number(f.week) === Number(week));
     const userFixIndex = fixtures.findIndex(f => Number(f.week) === Number(week) && (String(f.homeTeamId) === String(managedTeamId) || String(f.awayTeamId) === String(managedTeamId)));
@@ -700,7 +806,7 @@ export default function App() {
               player.appearances += 1;
               
               // Stamina costs per match
-              player.fitness = Math.max(40, player.fitness - 15 - Math.floor(Math.random() * 10));
+              player.fitness = Math.max(40, player.fitness - 15 - Math.floor(weekRng.range(0, 10)));
 
               // Goal Scoring mapped to scorers array matching names
               const matchingScorer = teamFix.scorers?.find(s => s.includes(player.name.split(' ')[1] || player.name));
@@ -709,7 +815,7 @@ export default function App() {
               }
               
               // Small rate of match evaluation updates
-              const performance = 6 + Math.floor(Math.random() * 4) - (opponentScore > userTeamScore ? 1 : 0);
+              const performance = 6 + Math.floor(weekRng.range(0, 4)) - (opponentScore > userTeamScore ? 1 : 0);
               player.avgRating = player.appearances === 1 
                 ? performance 
                 : (player.avgRating * (player.appearances - 1) + performance) / player.appearances;
@@ -731,7 +837,7 @@ export default function App() {
         const squadRoster = nextSquads[scId];
         squadRoster.forEach(player => {
           // Increase OVR depending on training balances
-          const randomDevelopment = Math.random();
+          const randomDevelopment = weekRng.next();
           if (randomDevelopment < 0.2) {
             player.rating = Math.min(99, player.rating + 1);
             if (player.position === 'ATT') player.shooting = Math.min(99, player.shooting + 1);
@@ -755,7 +861,7 @@ export default function App() {
         : "Maalesef sahadan mağlubiyetle ayrıldık. Yönetim kurulu maçtaki konsantrasyon kaybından rahatsız. Önümüzdeki antrenmanlarda savunma hattımızın uyum yeteneklerini geliştirerek açıkları kapatalım.";
 
       const matchReportMail: Mail = {
-        id: `m_rep_w${week}_${Math.random().toString(36).substr(2, 9)}`,
+        id: `m_rep_w${week}_${Math.floor(weekRng.range(0, 1_000_000_000)).toString(36)}`,
         sender: "Teknik Heyet Şefi",
         subject: matchBriefSubject,
         content: matchBriefContent,
@@ -783,11 +889,12 @@ export default function App() {
         standings: nextStandings,
         inbox: updatedInbox,
         week: week + 1,
-        totalWeeks
+        totalWeeks,
+        matchSeedSeed
       };
       saveStateToStorage(updatedState);
       
-      alert("Hafta maçları tamamlandı! Puan tablosu, oyuncu stamina değerleri ve email gelen kutusu başarıyla güncellendi.");
+      showNotice('Hafta Tamamlandı', 'Hafta maçları tamamlandı. Puan tablosu, oyuncu stamina değerleri ve email gelen kutusu güncellendi.', 'success');
     }
   };
 
@@ -815,6 +922,7 @@ export default function App() {
   if (isLobby) {
     return (
       <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col justify-center items-center p-4 relative font-sans">
+        {renderAppDialog()}
         {/* Glow ambient decorations */}
         <div className="absolute top-[20%] left-1/2 -translate-x-1/2 w-[340px] h-[340px] bg-[#FF007A]/15 rounded-full blur-[120px] pointer-events-none" />
         
@@ -896,8 +1004,34 @@ export default function App() {
     const aClub = teams.find(t => t.id === activeMatchFixture.awayTeamId) || teams[1] || { id: activeMatchFixture.awayTeamId, name: "Deplasman", badge: "", shortName: "AWAY", stadium: "Stadyum", reputation: 50 };
 
     return (
-      <div className="min-h-screen bg-zinc-950 text-zinc-100 flex p-4 justify-center items-center font-sans relative">
-        <div className="max-w-4xl w-full">
+      <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans relative">
+        {renderAppDialog()}
+        <header className="sticky top-0 z-[120] border-b border-zinc-800 bg-zinc-950/96 backdrop-blur-xl shadow-lg shadow-black/20">
+          <div className="max-w-5xl mx-auto px-2.5 sm:px-4 py-2 flex items-center gap-2.5">
+            <button
+              type="button"
+              onClick={() => setActiveMatchFixture(null)}
+              className="h-9 w-9 sm:w-auto sm:px-3 rounded-xl bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-zinc-100 flex items-center justify-center gap-2 transition-all active:scale-95 shrink-0"
+              aria-label="Ana ekrana dön"
+              title="Ana ekrana dön"
+            >
+              <ArrowLeft className="w-4 h-4" />
+              <span className="hidden sm:inline text-[11px] font-black uppercase tracking-wider">Geri</span>
+            </button>
+
+            <div className="min-w-0 flex-1 flex flex-col items-center justify-center leading-none">
+              <span className="text-[11px] sm:text-sm font-black text-zinc-100 uppercase tracking-wider">Maç Günü</span>
+              <span className="mt-1 text-[9px] font-mono font-bold text-zinc-500 truncate max-w-full">
+                {hClub.shortName || hClub.name} vs {aClub.shortName || aClub.name}
+              </span>
+            </div>
+
+            <div className="hidden sm:flex items-center justify-center px-2.5 py-1.5 rounded-xl bg-zinc-900 border border-zinc-800 text-[10px] font-mono font-black text-zinc-400 shrink-0">
+              Hafta {week}
+            </div>
+          </div>
+        </header>
+        <main className="max-w-5xl w-full mx-auto p-1.5 sm:p-4">
           <MatchEngine
             homeClub={hClub}
             awayClub={aClub}
@@ -907,8 +1041,9 @@ export default function App() {
             isUserHome={activeMatchFixture.homeTeamId === managedTeamId}
             initialSeed={matchSeedSeed}
             onMatchFinished={handleMatchSimulationFinished}
+            onNotify={showNotice}
           />
-        </div>
+        </main>
       </div>
     );
   }
@@ -918,6 +1053,7 @@ export default function App() {
   if (!isLobby && (teams.length === 0 || !managedTeamId)) {
     return (
       <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col justify-center items-center font-sans">
+        {renderAppDialog()}
         <RefreshCw className="w-8 h-8 text-[#FF007A] animate-spin mb-4" />
         <p className="text-sm font-mono text-zinc-400">Veritabanı yükleniyor, lütfen bekleyin...</p>
       </div>
@@ -932,6 +1068,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#07080A] text-zinc-100 font-sans pb-16 relative">
+      {renderAppDialog()}
       <div className="absolute top-0 right-1/4 w-80 h-80 bg-[#FF007A]/5 rounded-full blur-[140px] pointer-events-none" />
 
       {/* Modern Uniswap Styled Ticker Bar */}
@@ -940,7 +1077,7 @@ export default function App() {
           {gossipFeed.map((item, idx) => (
             <span key={idx} className="inline-flex gap-2 items-center">
               <span className="bg-[#FF007A]/15 text-[#FF007A] text-[9px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider">{item.tag}</span>
-              {item.title} • <span className="text-zinc-650">{item.description || "Gelişmeler takip ediliyor."}</span>
+              {item.title} • <span className="text-zinc-600">{item.description || "Gelişmeler takip ediliyor."}</span>
             </span>
           ))}
         </div>
@@ -959,7 +1096,7 @@ export default function App() {
             />
             <div>
               <div className="flex items-center gap-2">
-                <h1 className="text-lg font-bold text-zinc-105">{userClub?.name}</h1>
+                <h1 className="text-lg font-bold text-zinc-100">{userClub?.name}</h1>
                 <span className="bg-emerald-450/10 border border-emerald-500/20 text-emerald-400 text-[10px] font-mono font-bold px-2 py-0.5 rounded-full">
                   Sözleşme Var
                 </span>
@@ -1002,7 +1139,7 @@ export default function App() {
                   value={matchSeedSeed}
                   onChange={(e) => {
                     const val = parseInt(e.target.value) || 0;
-                    setMatchSeedSeed(val);
+                    handleMatchSeedChange(val);
                   }}
                   className="bg-transparent border-0 text-zinc-100 font-bold focus:outline-none w-28 text-[11px] p-0 leading-tight"
                   placeholder="Rastgele Tohum"
@@ -1022,7 +1159,7 @@ export default function App() {
 
         {/* Uniswap Styled Tab Pill Menu bar */}
         <div className="flex justify-start sm:justify-center items-center">
-          <div className="inline-flex overflow-x-auto p-1 bg-zinc-950 rounded-2xl border border-zinc-90 w-full sm:w-auto font-mono text-xs font-bold leading-none gap-0.5">
+          <div className="inline-flex overflow-x-auto p-1 bg-zinc-950 rounded-2xl border border-zinc-900 w-full sm:w-auto font-mono text-xs font-bold leading-none gap-0.5">
             <button
               onClick={() => setActiveTab('INBOX')}
               className={`p-2.5 px-5 rounded-xl shrink-0 transition-all flex items-center gap-1.5 ${
@@ -1114,6 +1251,8 @@ export default function App() {
               transferBudget={userClub?.transferBudget || 0}
               onUpdateSquad={handleUpdateSquad}
               onSellPlayer={handleSellPlayer}
+              onNotify={showNotice}
+              onRequestConfirm={requestConfirmation}
             />
           )}
 
@@ -1141,6 +1280,8 @@ export default function App() {
               squad={userSquad}
               onBuyPlayer={handleBuyPlayer}
               onSellPlayer={handleSellPlayer}
+              onNotify={showNotice}
+              onRequestConfirm={requestConfirmation}
             />
           )}
 
@@ -1156,12 +1297,15 @@ export default function App() {
             <DebugTab 
               teams={teams}
               squads={squads}
+              seed={matchSeedSeed}
+              onSeedChange={handleMatchSeedChange}
+              onNotify={showNotice}
             />
           )}
         </div>
 
         {/* Outer Utilities footer block */}
-        <div className="flex justify-between items-center border-t border-zinc-900 pt-6 mt-10 text-xs text-zinc-650 font-mono">
+        <div className="flex justify-between items-center border-t border-zinc-900 pt-6 mt-10 text-xs text-zinc-600 font-mono">
           <span>Championship Manager: Retro • Lisanslı Verilerle Simülasyon</span>
           <button 
             onClick={handleResetSave}

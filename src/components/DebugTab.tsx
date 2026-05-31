@@ -6,6 +6,9 @@ import { Play, Sparkles, Sliders, Activity, Award, ShieldAlert, BadgeInfo, Cpu, 
 interface DebugTabProps {
   teams: Club[];
   squads: Record<string, Player[]>;
+  seed: number;
+  onSeedChange: (seed: number) => void;
+  onNotify?: (title: string, message: string, variant?: 'info' | 'success' | 'warning' | 'danger') => void;
 }
 
 // Deterministic seed-based random generator
@@ -124,8 +127,7 @@ const REFEREE_PROFILES: Record<string, RefereeProfile> = {
   }
 };
 
-export default function DebugTab({ teams, squads }: DebugTabProps) {
-  const [seed, setSeed] = useState<number>(3409823);
+export default function DebugTab({ teams, squads, seed, onSeedChange, onNotify }: DebugTabProps) {
   const [homeTeamId, setHomeTeamId] = useState<string>('');
   const [awayTeamId, setAwayTeamId] = useState<string>('');
   const [weather, setWeather] = useState<string>('PERFECT');
@@ -150,18 +152,17 @@ export default function DebugTab({ teams, squads }: DebugTabProps) {
 
   // Handle building new seed matching
   const generateRandomSeed = () => {
-    const val = Math.floor(100000 + Math.random() * 9899000);
-    setSeed(val);
+    onSeedChange(Math.floor(Date.now() / 1000));
   };
 
   // Run Deterministic 90-Minute Simulation
   const handleSimulate90Minutes = () => {
     if (!homeTeamId || !awayTeamId) {
-      alert("Lütfen ev sahibi ve deplasman takımlarını seçin.");
+      onNotify?.('Takım Seçimi Eksik', 'Lütfen ev sahibi ve deplasman takımlarını seçin.', 'warning');
       return;
     }
     if (homeTeamId === awayTeamId) {
-      alert("Ev sahibi ve deplasman takımları aynı olamaz.");
+      onNotify?.('Geçersiz Eşleşme', 'Ev sahibi ve deplasman takımları aynı olamaz.', 'warning');
       return;
     }
 
@@ -739,7 +740,7 @@ export default function DebugTab({ teams, squads }: DebugTabProps) {
               <input
                 type="number"
                 value={seed}
-                onChange={(e) => setSeed(parseInt(e.target.value) || 0)}
+                onChange={(e) => onSeedChange(parseInt(e.target.value) || 0)}
                 className="flex-1 bg-zinc-950 border border-zinc-800 rounded-xl p-2.5 font-bold font-mono text-xs text-zinc-200 focus:outline-none focus:border-[#FF007A]"
                 placeholder="Örn: 3089422"
               />
@@ -846,7 +847,7 @@ export default function DebugTab({ teams, squads }: DebugTabProps) {
               <select
                 value={homeMentality}
                 onChange={(e) => setHomeMentality(e.target.value as any)}
-                className="w-full bg-zinc-950 border border-zinc-800 rounded-xl p-1.5 text-xs text-zinc-350"
+                className="w-full bg-zinc-950 border border-zinc-800 rounded-xl p-1.5 text-xs text-zinc-300"
               >
                 <option value="DEFENSIVE">Otobüsü Çek (Defans)</option>
                 <option value="BALANCED">Sistem Dengesi</option>
@@ -860,7 +861,7 @@ export default function DebugTab({ teams, squads }: DebugTabProps) {
               <select
                 value={awayMentality}
                 onChange={(e) => setAwayMentality(e.target.value as any)}
-                className="w-full bg-zinc-950 border border-zinc-800 rounded-xl p-1.5 text-xs text-zinc-350"
+                className="w-full bg-zinc-950 border border-zinc-800 rounded-xl p-1.5 text-xs text-zinc-300"
               >
                 <option value="DEFENSIVE">Otobüsü Çek (Defans)</option>
                 <option value="BALANCED">Sistem Dengesi</option>
@@ -1130,7 +1131,7 @@ export default function DebugTab({ teams, squads }: DebugTabProps) {
                         </div>
                         <div className="flex justify-between">
                           <span className="text-zinc-400">Mac Reytingi:</span>
-                          <span className={`${gk.performanceScore >= 7.0 ? 'text-green-400' : gk.performanceScore < 6.0 ? 'text-red-400' : 'text-zinc-350'} font-bold`}>
+                          <span className={`${gk.performanceScore >= 7.0 ? 'text-green-400' : gk.performanceScore < 6.0 ? 'text-red-400' : 'text-zinc-300'} font-bold`}>
                             {gk.performanceScore.toFixed(1)} / 10
                           </span>
                         </div>

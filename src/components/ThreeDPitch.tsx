@@ -63,6 +63,8 @@ export default function ThreeDPitch({
   const [cameraPreset, setCameraPreset] = useState<CameraPreset>('BROADCAST');
   const [isRotating, setIsRotating] = useState<boolean>(true);
   const [isSupported, setIsSupported] = useState<boolean>(true);
+  const homePossessionDisplay = possession.toFixed(2);
+  const awayPossessionDisplay = (100 - possession).toFixed(2);
 
   // Scene state refs for live animation coupling
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -169,10 +171,10 @@ export default function ThreeDPitch({
       if (fxState && (fxState.type === 'GOAL' || fxState.type === 'SAVE' || fxState.type === 'MISS')) {
         // It's a shot! Elevate the trajectory beautifully to the target height!
         const shotHeight = fxState.type === 'GOAL'
-          ? (0.5 + Math.random() * 1.5) // Goal height between 0.5m and 2.0m (crossbar 2.7)
+          ? 1.35
           : fxState.type === 'SAVE'
-            ? (0.2 + Math.random() * 1.6) // Keeper save zone height
-            : (2.9 + Math.random() * 1.1); // Miss: flies over crossbar (2.7)
+            ? 1.05
+            : 3.35;
 
         // Perfect ballistic trajectory physics formula
         ballPhysicsRef.current.vy = (shotHeight - ballPhysicsRef.current.y) / travelTime - 0.5 * (-18.5) * travelTime;
@@ -405,8 +407,7 @@ export default function ThreeDPitch({
       renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance' });
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
       renderer.setSize(width, height);
-      renderer.shadowMap.enabled = true;
-      renderer.shadowMap.type = THREE.PCFShadowMap;
+      renderer.shadowMap.enabled = false;
 
       // Clean out container children to avoid re-renders overlaps
       while (containerRef.current.firstChild) {
@@ -466,7 +467,7 @@ export default function ThreeDPitch({
       })
     );
     grassMesh.rotation.x = -Math.PI / 2;
-    grassMesh.receiveShadow = true;
+    grassMesh.receiveShadow = false;
     scene.add(grassMesh);
 
     // 6. Subdivided Nylon Goal Nets Mesh
@@ -959,10 +960,12 @@ export default function ThreeDPitch({
         const pGroup = playersGroupRef.current?.getObjectByName(carryId);
         if (pGroup) {
           const isHome = pGroup.userData.team === 'home';
-          // Offsets the ball 0.38m directly in front of the running player model depending on their team side orientation
-          let zOffset = isHome ? 0.38 : -0.38;
-          b.x = pGroup.position.x;
-          b.y = 0.25; // Sits nicely on turf
+          const dribbleT = (pGroup.userData.animTime || 0) * 2.2;
+          const sideTouch = Math.sin(dribbleT) * 0.17;
+          const forwardTouch = 0.38 + Math.max(0, Math.sin(dribbleT * 1.4)) * 0.14;
+          const zOffset = isHome ? forwardTouch : -forwardTouch;
+          b.x = pGroup.position.x + sideTouch;
+          b.y = 0.25 + Math.max(0, Math.sin(dribbleT * 1.8)) * 0.06;
           b.z = pGroup.position.z + zOffset;
           b.vx = 0;
           b.vy = 0;
@@ -1212,6 +1215,12 @@ export default function ThreeDPitch({
       if (rendererRef.current) {
         rendererRef.current.dispose();
       }
+      sceneRef.current = null;
+      cameraRef.current = null;
+      rendererRef.current = null;
+      playersGroupRef.current = null;
+      ballMeshRef.current = null;
+      refereeMeshRef.current = null;
     };
   }, [isSupported]);
 
@@ -1238,27 +1247,8 @@ export default function ThreeDPitch({
         pGroup.name = player.id;
         pGroup.position.set(c.x, 0, c.z);
 
-        // A. Heavy Subbuteo visual weighted circular grass plate disc
-        const pColor = isGK ? '#f59e0b' : (isHome ? '#da020e' : '#0284c7');
-        const plateMat = new THREE.MeshStandardMaterial({
-          color: pColor,
-          roughness: 0.15,
-          metalness: 0.42
-        });
-        const diskBase = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, 0.08, 16), plateMat);
-        diskBase.castShadow = true;
-        pGroup.add(diskBase);
-
-        // B. Dark micro-gloss ring trimmer inner
-        const innerRing = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.44, 0.44, 0.04, 16),
-          new THREE.MeshStandardMaterial({ color: 0x111827, roughness: 0.25 })
-        );
-        innerRing.position.y = 0.06;
-        pGroup.add(innerRing);
-
-        // C. Skin head sphere
-        const skinColors = [0xfbcfe8, 0xfed7aa, 0xfde047, 0xfca5a5];
+        // A. Real player body without arcade base rings.
+        const skinColors = [0xf2c9a0, 0xd6a06f, 0x8d5524, 0xffdbac];
         const randomSkin = skinColors[player.name.charCodeAt(0) % skinColors.length];
         const headGeo = new THREE.SphereGeometry(0.2, 12, 12);
         const headMat = new THREE.MeshStandardMaterial({
@@ -1272,16 +1262,7 @@ export default function ThreeDPitch({
         headMesh.castShadow = true;
         pGroup.add(headMesh);
 
-        // Hair block mesh
-        const hairColors = [0x111827, 0x475569, 0xb45309, 0xfacc15];
-        const randomHair = hairColors[player.name.charCodeAt(1) % hairColors.length];
-        const hairGeo = new THREE.BoxGeometry(0.24, 0.08, 0.22);
-        const hairMat = new THREE.MeshStandardMaterial({ color: randomHair, roughness: 0.85 });
-        const hairMesh = new THREE.Mesh(hairGeo, hairMat);
-        hairMesh.position.set(0, 1.34, 0.03); // slightly top back
-        headMesh.add(hairMesh);
-
-        // Real facial eyes for player characters (super cute details)
+        // Subtle facial details for close camera angles.
         const eyeGeo = new THREE.SphereGeometry(0.025, 6, 6);
         const eyeMat = new THREE.MeshBasicMaterial({ color: 0x111827 });
         const leftEye = new THREE.Mesh(eyeGeo, eyeMat);
@@ -1291,16 +1272,16 @@ export default function ThreeDPitch({
         headMesh.add(leftEye);
         headMesh.add(rightEye);
 
-        // Smile mouth arc
+        // Small mouth mark for front-facing closeups.
         const mouthGeo = new THREE.BoxGeometry(0.06, 0.012, 0.02);
         const mouthMat = new THREE.MeshBasicMaterial({ color: 0xba1d1d });
         const faceMouth = new THREE.Mesh(mouthGeo, mouthMat);
         faceMouth.position.set(0, -0.08, 0.17);
         headMesh.add(faceMouth);
 
-        // D. PRISTINE 3D Torso Box with distinct FRONT AND BACK multi materials mapping
+        // B. Slim jersey torso with distinct front and back materials.
         // This ensures names and shirt numbers are highly visible in pristine detail!
-        const torsoGeo = new THREE.BoxGeometry(0.55, 0.65, 0.3);
+        const torsoGeo = new THREE.BoxGeometry(0.46, 0.68, 0.26);
         const sideMaterial = new THREE.MeshStandardMaterial({
           color: isGK ? 0xf59e0b : (isHome ? 0xda020e : 0x0284c7),
           roughness: 0.5
@@ -1331,18 +1312,20 @@ export default function ThreeDPitch({
         torsoMesh.receiveShadow = true;
         pGroup.add(torsoMesh);
 
-        // Shorts Mesh
+        // Shorts mesh: rectangular football shorts, not a circular stand.
         const shortsColor = isHome ? 0xffffff : 0x1e293b;
         const shortsBar = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.25, 0.27, 0.22, 12),
+          new THREE.BoxGeometry(0.42, 0.22, 0.26),
           new THREE.MeshStandardMaterial({ color: shortsColor, roughness: 0.6 })
         );
         shortsBar.position.set(0, 0.46, 0);
+        shortsBar.castShadow = true;
         pGroup.add(shortsBar);
 
-        // E. Limb Cylinders (Left Leg leg group)
-        const thighGeo = new THREE.CylinderGeometry(0.08, 0.07, 0.38, 8);
+        // C. Limb cylinders with real boots planted on the pitch.
+        const thighGeo = new THREE.CylinderGeometry(0.07, 0.06, 0.4, 10);
         const skinMat = new THREE.MeshStandardMaterial({ color: randomSkin, roughness: 0.62 });
+        const bootMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.54 });
 
         const leftLeg = new THREE.Group();
         leftLeg.name = 'leftLeg';
@@ -1360,15 +1343,15 @@ export default function ThreeDPitch({
           new THREE.MeshStandardMaterial({ color: sockColor, roughness: 0.7 })
         );
         leftSock.position.set(0, -0.24, 0);
+        leftSock.castShadow = true;
         leftLeg.add(leftSock);
 
-        // Soccer Boots (Cleats)
-        const leftBoot = new THREE.Mesh(
-          new THREE.BoxGeometry(0.09, 0.07, 0.18),
-          new THREE.MeshStandardMaterial({ color: 0x18181b, roughness: 0.2 })
-        );
-        leftBoot.position.set(0, -0.34, 0.04);
+        const leftBoot = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.07, 0.28), bootMat);
+        leftBoot.name = 'leftBoot';
+        leftBoot.position.set(0, -0.36, 0.08);
+        leftBoot.castShadow = true;
         leftLeg.add(leftBoot);
+
         pGroup.add(leftLeg);
 
         // Leg Right group
@@ -1386,14 +1369,15 @@ export default function ThreeDPitch({
           new THREE.MeshStandardMaterial({ color: sockColor, roughness: 0.7 })
         );
         rightSock.position.set(0, -0.24, 0);
+        rightSock.castShadow = true;
         rightLeg.add(rightSock);
 
-        const rightBoot = new THREE.Mesh(
-          new THREE.BoxGeometry(0.09, 0.07, 0.18),
-          new THREE.MeshStandardMaterial({ color: 0x18181b, roughness: 0.2 })
-        );
-        rightBoot.position.set(0, -0.34, 0.04);
+        const rightBoot = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.07, 0.28), bootMat);
+        rightBoot.name = 'rightBoot';
+        rightBoot.position.set(0, -0.36, 0.08);
+        rightBoot.castShadow = true;
         rightLeg.add(rightBoot);
+
         pGroup.add(rightLeg);
 
         // Sleeve arms
@@ -1428,48 +1412,6 @@ export default function ThreeDPitch({
         handR.position.y = -0.21;
         rightArm.add(handR);
         pGroup.add(rightArm);
-
-        // F. Subtly styled shadow ring on the grass
-        const shadowDisk = new THREE.Mesh(
-          new THREE.RingGeometry(0.01, 0.44, 16),
-          new THREE.MeshBasicMaterial({ color: 0x032411, transparent: true, opacity: 0.4, side: THREE.DoubleSide })
-        );
-        shadowDisk.rotation.x = -Math.PI / 2;
-        shadowDisk.position.y = 0.005;
-        pGroup.add(shadowDisk);
-
-        // G. High-Definition floating crisp name tag panel above player head
-        const nameCanvas = document.createElement('canvas');
-        nameCanvas.width = 256;
-        nameCanvas.height = 64;
-        const nCtx = nameCanvas.getContext('2d');
-        if (nCtx) {
-          // Glass badge backdrop
-          nCtx.fillStyle = 'rgba(15, 23, 42, 0.88)';
-          nCtx.beginPath();
-          nCtx.roundRect(10, 8, 236, 48, 12);
-          nCtx.fill();
-
-          // Border color accent representing team colors
-          nCtx.strokeStyle = isGK ? '#facc15' : (isHome ? '#fca5a5' : '#93c5fd');
-          nCtx.lineWidth = 3.5;
-          nCtx.stroke();
-
-          // Write name & rating in center
-          nCtx.fillStyle = '#ffffff';
-          nCtx.textAlign = 'center';
-          nCtx.textBaseline = 'middle';
-          nCtx.font = 'bold 22px "Inter", sans-serif';
-          const shortStr = getFormattedShortName(player.name);
-          nCtx.fillText(`${shortStr} [${player.rating}]`, 128, 32);
-        }
-        const nameTex = new THREE.CanvasTexture(nameCanvas);
-        nameTex.needsUpdate = true;
-        const nameSpriteMat = new THREE.SpriteMaterial({ map: nameTex, depthTest: false }); // keep float on top
-        const nameSprite = new THREE.Sprite(nameSpriteMat);
-        nameSprite.scale.set(1.9, 0.48, 1);
-        nameSprite.position.set(0, 1.75, 0); // overhead height
-        pGroup.add(nameSprite);
 
         pGroup.position.set(c.x, 0, c.z);
         pGroup.userData.targetX = c.x;
@@ -1508,6 +1450,8 @@ export default function ThreeDPitch({
     if (!refereeMeshRef.current) {
       const refGroup = new THREE.Group();
       refGroup.name = 'referee';
+      refGroup.scale.setScalar(1.12);
+      refGroup.renderOrder = 8;
 
       // 1. Ref head skin
       const refHead = new THREE.Mesh(
@@ -1516,14 +1460,6 @@ export default function ThreeDPitch({
       );
       refHead.position.set(0, 1.25, 0);
       refGroup.add(refHead);
-
-      // Dark hairs
-      const refHair = new THREE.Mesh(
-        new THREE.BoxGeometry(0.2, 0.08, 0.2),
-        new THREE.MeshStandardMaterial({ color: 0x111827, roughness: 0.9 })
-      );
-      refHair.position.set(0, 0.1, 0);
-      refHead.add(refHair);
 
       // 2. Torso Outfit (Bright neon yellow card-referee jersey)
       const refTorso = new THREE.Mesh(
@@ -1629,10 +1565,15 @@ export default function ThreeDPitch({
       rSprite.position.set(0, 1.62, 0);
       refGroup.add(rSprite);
 
-      scene.add(refGroup);
       refereeMeshRef.current = refGroup;
     }
-  }, []);
+
+    if (refereeMeshRef.current.parent !== scene) {
+      const rc = mapCoords(referee.x, referee.y);
+      refereeMeshRef.current.position.set(rc.x, 0.02, rc.z);
+      scene.add(refereeMeshRef.current);
+    }
+  }, [isSupported, pitchPlayers.length, referee.x, referee.y]);
 
   if (!isSupported) {
     return (
@@ -1648,14 +1589,14 @@ export default function ThreeDPitch({
 
 
   return (
-    <div className="flex flex-col gap-3 h-full animate-fade-in" id="threejs-3d-stadium-view">
+    <div className="flex flex-col gap-1.5 sm:gap-3 h-full animate-fade-in" id="threejs-3d-stadium-view">
       {/* 3D Stadium Header Stats Indicator */}
-      <div className="flex justify-between items-center bg-zinc-900 border border-zinc-800 rounded-2xl px-4 py-2 text-xs font-mono shadow-md">
+      <div className="flex justify-between items-center bg-zinc-900 border border-zinc-800 rounded-xl sm:rounded-2xl px-3 sm:px-4 py-1.5 sm:py-2 text-[10px] sm:text-xs font-mono shadow-md">
         <span className="text-zinc-400 font-bold flex items-center gap-2">
           <Maximize2 className="w-3.5 h-3.5 text-[#FF007A]" /> 3D Canlı Yayın Stadyumu
         </span>
         <div className="flex gap-2 items-center">
-          <span className="text-[10px] bg-indigo-500/15 text-indigo-400 px-2 py-0.5 rounded font-bold uppercase">
+          <span className="text-[8px] sm:text-[10px] bg-indigo-500/15 text-indigo-400 px-2 py-0.5 rounded font-bold uppercase">
             3D FİZİK OKOK
           </span>
           <span className="hidden sm:inline text-zinc-500">• Fare ile döndürebilir ve kamerayı kaydırabilirsiniz</span>
@@ -1663,7 +1604,7 @@ export default function ThreeDPitch({
       </div>
 
       {/* Main Container viewport */}
-      <div className="relative w-full h-[340px] sm:h-[420px] md:h-[480px] bg-gradient-to-b from-zinc-950 to-zinc-900 rounded-[32px] border border-zinc-850 overflow-hidden shadow-2xl">
+      <div className="relative w-full h-[58svh] min-h-[390px] max-h-[680px] sm:h-[520px] md:h-[620px] bg-gradient-to-b from-zinc-950 to-zinc-900 rounded-2xl sm:rounded-[32px] border border-zinc-800 overflow-hidden shadow-2xl">
         
         {/* Sky Stadium atmospheric starry dark atmosphere */}
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_var(--tw-gradient-stops))] from-indigo-950/25 via-zinc-950 to-zinc-950 pointer-events-none z-0" />
@@ -1676,15 +1617,15 @@ export default function ThreeDPitch({
         <div ref={containerRef} className="w-full h-full z-10 relative cursor-grab active:cursor-grabbing" />
 
         {/* Interactive Overlay Float controls */}
-        <div className="absolute bottom-4 left-4 right-4 flex flex-wrap gap-2 justify-between items-center pointer-events-none z-30">
+        <div className="absolute bottom-2 sm:bottom-4 left-2 sm:left-4 right-2 sm:right-4 flex flex-wrap gap-1.5 sm:gap-2 justify-between items-center pointer-events-none z-30">
           
           {/* Camera Presets Selector */}
-          <div className="flex gap-1.5 p-1 bg-zinc-950/85 backdrop-blur-md rounded-xl border border-zinc-800 pointer-events-auto shadow-lg">
+          <div className="flex gap-1 p-1 bg-zinc-950/85 backdrop-blur-md rounded-xl border border-zinc-800 pointer-events-auto shadow-lg overflow-x-auto max-w-full">
             {(['BROADCAST', 'TACTICAL_3D', 'BEHIND_GOAL', 'TACTICAL'] as CameraPreset[]).map((preset) => (
               <button
                 key={preset}
                 onClick={() => setCameraPreset(preset)}
-                className={`px-2.5 py-1 text-[9px] font-mono font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
+                className={`px-2 sm:px-2.5 py-1 text-[8px] sm:text-[9px] font-mono font-bold rounded-lg transition-all flex items-center gap-1 sm:gap-1.5 cursor-pointer whitespace-nowrap ${
                   cameraPreset === preset
                     ? 'bg-[#FF007A] text-white shadow font-black'
                     : 'text-zinc-400 hover:text-white hover:bg-zinc-900'
@@ -1699,7 +1640,7 @@ export default function ThreeDPitch({
           {/* Idle Auto Rotation toggle */}
           <button
             onClick={() => setIsRotating(!isRotating)}
-            className={`pointer-events-auto px-3 py-1 text-[9px] font-mono font-bold rounded-xl border backdrop-blur-md flex items-center gap-1.5 shadow-lg transition-all cursor-pointer ${
+            className={`pointer-events-auto px-2.5 sm:px-3 py-1 text-[8px] sm:text-[9px] font-mono font-bold rounded-xl border backdrop-blur-md flex items-center gap-1.5 shadow-lg transition-all cursor-pointer ${
               isRotating
                 ? 'bg-emerald-950/85 border-emerald-800 text-emerald-400'
                 : 'bg-zinc-900/85 border-zinc-800 text-zinc-400 hover:text-white'
@@ -1711,15 +1652,15 @@ export default function ThreeDPitch({
         </div>
 
         {/* Real-time possession bar visual floating inside 3D pitch */}
-        <div className="absolute top-4 left-4 right-4 pointer-events-none flex justify-between items-center z-30">
-          <div className="bg-zinc-950/80 backdrop-blur-md border border-zinc-800 rounded-xl px-3 py-1.5 text-[10px] sm:text-xs text-white shadow-lg flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-red-500 animate-ping" />
-            <span className="font-bold text-zinc-200">{homeClub.shortName} %{possession}</span>
-            <div className="w-16 h-1.5 bg-zinc-850 rounded-full overflow-hidden flex">
+        <div className="absolute top-2 sm:top-4 left-2 sm:left-4 right-2 sm:right-4 pointer-events-none flex justify-between items-center z-30">
+          <div className="bg-zinc-950/80 backdrop-blur-md border border-zinc-800 rounded-xl px-2.5 sm:px-3 py-1 sm:py-1.5 text-[9px] sm:text-xs text-white shadow-lg flex items-center gap-1.5 sm:gap-2">
+            <span className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-red-500 animate-ping" />
+            <span className="font-bold text-zinc-200">{homeClub.shortName} %{homePossessionDisplay}</span>
+            <div className="w-12 sm:w-16 h-1.5 bg-zinc-800 rounded-full overflow-hidden flex">
               <div className="bg-red-500 h-full animate-pulse" style={{ width: `${possession}%` }} />
               <div className="bg-blue-500 h-full animate-pulse" style={{ width: `${100 - possession}%` }} />
             </div>
-            <span className="font-bold text-zinc-450">%{100 - possession} {awayClub.shortName}</span>
+            <span className="font-bold text-zinc-300">%{awayPossessionDisplay} {awayClub.shortName}</span>
           </div>
         </div>
 

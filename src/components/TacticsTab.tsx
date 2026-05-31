@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Tactics, Player } from '../types';
 import { Sliders, HelpCircle, Swords, Shuffle, Zap, X, RefreshCw, UserCheck } from 'lucide-react';
+import { soundEngine } from '../utils/soundEngine';
 
 interface TacticsTabProps {
   tactics: Tactics;
@@ -83,7 +84,12 @@ const FORMATION_COORDINATES: Record<string, Record<number, { left: string; botto
 export default function TacticsTab({ tactics, squad, onUpdateTactics, onUpdateSquad }: TacticsTabProps) {
   const [activeSlotIndex, setActiveSlotIndex] = useState<number | null>(null);
 
+  const playTacticSound = () => {
+    soundEngine.playCommentaryTick();
+  };
+
   const handleFormationChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    playTacticSound();
     onUpdateTactics({
       ...tactics,
       formation: e.target.value as Tactics['formation']
@@ -91,6 +97,7 @@ export default function TacticsTab({ tactics, squad, onUpdateTactics, onUpdateSq
   };
 
   const handleMentalityChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    playTacticSound();
     onUpdateTactics({
       ...tactics,
       mentality: e.target.value as Tactics['mentality']
@@ -98,6 +105,7 @@ export default function TacticsTab({ tactics, squad, onUpdateTactics, onUpdateSq
   };
 
   const handleStyleChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    playTacticSound();
     onUpdateTactics({
       ...tactics,
       style: e.target.value as Tactics['style']
@@ -105,10 +113,12 @@ export default function TacticsTab({ tactics, squad, onUpdateTactics, onUpdateSq
   };
 
   const handleTempoChange = (val: Tactics['tempo']) => {
+    playTacticSound();
     onUpdateTactics({ ...tactics, tempo: val });
   };
 
   const handlePassingChange = (val: Tactics['passing']) => {
+    playTacticSound();
     onUpdateTactics({ ...tactics, passing: val });
   };
 
@@ -157,6 +167,7 @@ export default function TacticsTab({ tactics, squad, onUpdateTactics, onUpdateSq
     });
     
     onUpdateSquad(updatedSquad);
+    soundEngine.playKick();
     setActiveSlotIndex(null);
   };
 
@@ -173,6 +184,7 @@ export default function TacticsTab({ tactics, squad, onUpdateTactics, onUpdateSq
     });
     
     onUpdateSquad(updatedSquad);
+    soundEngine.playMatchEnd();
     setActiveSlotIndex(null);
   };
 
@@ -184,7 +196,7 @@ export default function TacticsTab({ tactics, squad, onUpdateTactics, onUpdateSq
       {/* Visual Miniature Football Pitch */}
       <div className="lg:col-span-8 flex flex-col gap-3">
         <div className="bg-white p-4 rounded-[24px] border border-zinc-200 flex justify-between items-center shadow-sm">
-          <span className="text-zinc-805 font-bold text-sm flex items-center gap-2">
+          <span className="text-zinc-900 font-bold text-sm flex items-center gap-2">
             <Swords className="w-4 h-4 text-[#FF007A]" /> Retro Taktik Tahtası • {tactics.formation}
           </span>
           <span className="text-xs text-zinc-500 font-mono hidden sm:inline">Oyuncu değiştirmek için pozisyona tıklayın</span>
@@ -250,7 +262,10 @@ export default function TacticsTab({ tactics, squad, onUpdateTactics, onUpdateSq
                 key={posIndex}
                 className="absolute -translate-x-1/2 -translate-y-1/2 flex flex-col items-center select-none cursor-pointer group active:scale-95 transition-all duration-100 z-20"
                 style={{ left: posConfig.left, bottom: posConfig.bottom }}
-                onClick={() => setActiveSlotIndex(i)}
+                onClick={() => {
+                  playTacticSound();
+                  setActiveSlotIndex(i);
+                }}
               >
                 {player ? (
                   <div className="flex flex-col items-center">
@@ -276,9 +291,9 @@ export default function TacticsTab({ tactics, squad, onUpdateTactics, onUpdateSq
                       </div>
                     </div>
                     {/* Position & Surname Tag */}
-                    <div className="mt-1.5 bg-zinc-950/85 border border-white/20 backdrop-blur-sm px-2 py-0.5 rounded-md text-center max-w-[90px] sm:max-w-[115px] truncate shadow-lg">
+                    <div className="mt-1.5 bg-black/92 border border-white/40 backdrop-blur-sm px-2 py-0.5 rounded-md text-center max-w-[90px] sm:max-w-[115px] truncate shadow-lg">
                       <p className="text-[8px] font-bold text-red-400 font-mono leading-tight">{posConfig.label}</p>
-                      <p className="text-[9px] text-zinc-100 truncate font-semibold leading-tight">{player.name.split(' ')[1] || player.name}</p>
+                      <p className="text-[9px] text-white truncate font-black leading-tight drop-shadow-[0_1px_1px_rgba(0,0,0,1)]">{player.name.split(' ')[1] || player.name}</p>
                     </div>
                   </div>
                 ) : (
@@ -294,7 +309,7 @@ export default function TacticsTab({ tactics, squad, onUpdateTactics, onUpdateSq
                       </svg>
                       <div className="absolute inset-0 flex flex-col items-center justify-center -mt-1 select-none pointer-events-none text-center">
                         <span className="text-white/60 font-mono text-[7px] font-black uppercase tracking-wider scale-[0.85]">EKLE</span>
-                        <span className="text-[6.5px] text-zinc-350/50 font-bold uppercase tracking-tighter leading-none mt-0.5">{posConfig.label}</span>
+                        <span className="text-[6.5px] text-zinc-300/50 font-bold uppercase tracking-tighter leading-none mt-0.5">{posConfig.label}</span>
                       </div>
                     </div>
                     <div className="mt-1.5 bg-emerald-950/80 border border-emerald-800/20 px-1.5 py-0.5 rounded-md text-center shadow-md">
@@ -344,7 +359,7 @@ export default function TacticsTab({ tactics, squad, onUpdateTactics, onUpdateSq
                         className="p-2.5 rounded-xl bg-zinc-900/40 hover:bg-zinc-800 border border-zinc-900 hover:border-zinc-700 cursor-pointer flex items-center justify-between transition-colors duration-155"
                       >
                         <div className="flex flex-col min-w-0">
-                          <span className="text-xs font-bold truncate flex items-center gap-1.5">
+                          <span className="text-xs font-bold text-zinc-100 truncate flex items-center gap-1.5">
                             {player.name}
                             <span className="text-[9px] bg-zinc-800 text-zinc-400 px-1 rounded-sm uppercase">{player.position}</span>
                           </span>
@@ -392,7 +407,7 @@ export default function TacticsTab({ tactics, squad, onUpdateTactics, onUpdateSq
             <select
               value={tactics.formation}
               onChange={handleFormationChange}
-              className="w-full bg-zinc-50 border border-zinc-200 rounded-xl p-2.5 text-xs text-zinc-805 font-mono font-bold focus:outline-none focus:border-[#FF007A]"
+              className="w-full bg-zinc-50 border border-zinc-200 rounded-xl p-2.5 text-xs text-zinc-900 font-mono font-bold focus:outline-none focus:border-[#FF007A]"
             >
               <option value="4-4-2">4-4-2 (Klasik İngiliz)</option>
               <option value="4-3-3">4-3-3 (Ofansif Kanatlar)</option>
@@ -408,7 +423,7 @@ export default function TacticsTab({ tactics, squad, onUpdateTactics, onUpdateSq
             <select
               value={tactics.mentality}
               onChange={handleMentalityChange}
-              className="w-full bg-zinc-50 border border-zinc-200 rounded-xl p-2.5 text-xs text-zinc-805 font-mono font-bold focus:outline-none focus:border-[#FF007A]"
+              className="w-full bg-zinc-50 border border-zinc-200 rounded-xl p-2.5 text-xs text-zinc-900 font-mono font-bold focus:outline-none focus:border-[#FF007A]"
             >
               <option value="DEFENSIVE">Savunmacı (Geri Çekil)</option>
               <option value="CAUTIOUS">Dikkatli (Kontra)</option>
@@ -424,7 +439,7 @@ export default function TacticsTab({ tactics, squad, onUpdateTactics, onUpdateSq
             <select
               value={tactics.style}
               onChange={handleStyleChange}
-              className="w-full bg-zinc-50 border border-zinc-200 rounded-xl p-2.5 text-xs text-zinc-805 font-mono font-bold focus:outline-none focus:border-[#FF007A]"
+              className="w-full bg-zinc-50 border border-zinc-200 rounded-xl p-2.5 text-xs text-zinc-900 font-mono font-bold focus:outline-none focus:border-[#FF007A]"
             >
               <option value="TIKI_TAKA">Tiki-Taka (Kısa Pas & Kontrol)</option>
               <option value="GEGENPRESS">Gegenpressing (Önde Hızlı Pres)</option>

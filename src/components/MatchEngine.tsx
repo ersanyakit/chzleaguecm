@@ -25,6 +25,7 @@ interface MatchEngineProps {
       awayPos: number;
     }
   }) => void;
+  onNotify?: (title: string, message: string, variant?: 'info' | 'success' | 'warning' | 'danger') => void;
 }
 
 // Pool of nostalgic, high-tension match commentaries in Turkish
@@ -116,6 +117,14 @@ interface LiveBallState {
   lastShotTick: number;
 }
 
+interface PlannedGoal {
+  minute: number;
+  team: TeamSide;
+  scorerId?: string;
+  played: boolean;
+  y: number;
+}
+
 declare global {
   interface Window {
     __MATCH_DEBUG__?: boolean;
@@ -148,8 +157,16 @@ const normalize = (x: number, y: number) => {
   if (len < 0.0001) return { x: 0, y: 0, len: 0 };
   return { x: x / len, y: y / len, len };
 };
+const hashSeed = (input: string) => {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+};
 
-export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, userTactics, isUserHome, initialSeed, onMatchFinished }: MatchEngineProps) {
+export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, userTactics, isUserHome, initialSeed, onMatchFinished, onNotify }: MatchEngineProps) {
   const [matchSeed, setMatchSeed] = useState(initialSeed || 1780083284);
   const rngRef = useRef<SeededRandom>(new SeededRandom(initialSeed || 1780083284));
 
@@ -254,6 +271,23 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     totalPossTicks: 0,
     lastShotTick: -999
   });
+  const matchPlanRef = useRef<{ seed: number; goals: PlannedGoal[] }>({ seed: matchSeed, goals: [] });
+
+  useEffect(() => {
+    const shouldPlayCrowd = !preMatchSetup && isSimulating && !matchDone && matchViewMode === '3D';
+
+    if (shouldPlayCrowd && !soundMuted) {
+      soundEngine.playCrowd();
+    } else {
+      soundEngine.stopCrowd(!shouldPlayCrowd);
+    }
+  }, [preMatchSetup, isSimulating, matchDone, matchViewMode, soundMuted]);
+
+  useEffect(() => {
+    return () => {
+      soundEngine.stopCrowd();
+    };
+  }, []);
 
   // Helper for generating initial coordinates of 22 players on the pitch
   const getTacticalCoords = (formation: Tactics['formation'], isHome: boolean) => {
@@ -452,6 +486,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
   };
 
   const handleReplayMatch = () => {
+    prepareMatchPlan(matchSeed);
     resetRNG(matchSeed);
     resetLivePhysics();
     setMinute(0);
@@ -469,6 +504,11 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     setMatchDone(false);
     setShowMatchEndOverlay(false);
     setIsSimulating(true);
+    soundEngine.playMatchStart();
+    soundEngine.playWhistle(true);
+    if (matchViewMode === '3D') {
+      soundEngine.playCrowd();
+    }
     setSubCount(0);
     setPitchPlayers(getInitialPositions(homeSquad, awaySquad, homeFormation, awayFormation));
 
@@ -480,6 +520,24 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     pendingGoalRef.current = null;
     pendingShotRef.current = null;
     lastPassTimeRef.current = 0;
+  };
+
+  const toggleSimulation = () => {
+    setIsSimulating((wasSimulating) => {
+      const nextSimulating = !wasSimulating;
+
+      if (nextSimulating) {
+        soundEngine.playMatchStart();
+        if (matchViewMode === '3D') {
+          soundEngine.playCrowd();
+        }
+      } else {
+        soundEngine.playMatchEnd();
+        soundEngine.stopCrowd();
+      }
+
+      return nextSimulating;
+    });
   };
 
   useEffect(() => {
@@ -540,6 +598,164 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
 
   const homeOvr = getTeamRosterOvr(homeSquad);
   const awayOvr = getTeamRosterOvr(awaySquad);
+
+  const getGoalBias = (mentality: Tactics['mentality'], style: Tactics['style']) => {
+    const mentalityBias = {
+      DEFENSIVE: -0.32,
+      CAUTIOUS: -0.14,
+      BALANCED: 0,
+      ATTACKING: 0.26,
+      OVERLOAD: 0.42
+    }[mentality];
+    const styleBias = {
+      TIKI_TAKA: 0.05,
+      GEGENPRESS: 0.12,
+      WING_PLAY: 0.08,
+      PARK_BUS: -0.24,
+      COUNTER_ATTACK: 0.1
+    }[style];
+    return mentalityBias + styleBias;
+  };
+
+  const sampleGoals = (rng: SeededRandom, expectedGoals: number) => {
+    let goals = 0;
+    for (let slot = 0; slot < 6; slot++) {
+      const chance = clamp(expectedGoals / (slot + 1.85), 0.02, 0.74);
+      if (rng.next() < chance) goals++;
+    }
+    return clamp(goals, 0, 5);
+  };
+
+  const choosePlannedScorer = (rng: SeededRandom, team: TeamSide) => {
+    const squad = (team === 'home' ? homeSquad : awaySquad).filter(p => p.isStarting);
+    const ordered = [...squad].sort((a, b) => {
+      const roleA = a.position === 'ATT' ? 30 : a.position === 'MID' ? 18 : a.position === 'DEF' ? 6 : 1;
+      const roleB = b.position === 'ATT' ? 30 : b.position === 'MID' ? 18 : b.position === 'DEF' ? 6 : 1;
+      return (b.rating + roleB) - (a.rating + roleA);
+    });
+    if (ordered.length === 0) return undefined;
+    const topWindow = ordered.slice(0, Math.min(6, ordered.length));
+    return rng.choice(topWindow)?.id;
+  };
+
+  const prepareMatchPlan = (seed: number) => {
+    const planSeed = (seed || 1) + hashSeed(`${homeClub.id}:${awayClub.id}:${homeMentality}:${awayMentality}:${homeStyle}:${awayStyle}:${homeFormation}:${awayFormation}`);
+    const rng = new SeededRandom(planSeed);
+    const homeExpected = clamp(1.18 + (homeOvr - awayOvr) * 0.035 + 0.18 + getGoalBias(homeMentality, homeStyle), 0.2, 3.85);
+    const awayExpected = clamp(1.05 + (awayOvr - homeOvr) * 0.035 + getGoalBias(awayMentality, awayStyle), 0.2, 3.65);
+    const homeGoals = sampleGoals(rng, homeExpected);
+    const awayGoals = sampleGoals(rng, awayExpected);
+    const usedMinutes = new Set<number>();
+    const goals: PlannedGoal[] = [];
+
+    const reserveMinute = () => {
+      let minute = Math.floor(rng.range(7, 88));
+      while (usedMinutes.has(minute) || minute === 45) {
+        minute = minute >= 88 ? 7 : minute + 1;
+      }
+      usedMinutes.add(minute);
+      return minute;
+    };
+
+    const addGoals = (team: TeamSide, count: number) => {
+      for (let i = 0; i < count; i++) {
+        goals.push({
+          minute: reserveMinute(),
+          team,
+          scorerId: choosePlannedScorer(rng, team),
+          played: false,
+          y: clamp(47 + rng.range(-7, 7), 39, 61)
+        });
+      }
+    };
+
+    addGoals('home', homeGoals);
+    addGoals('away', awayGoals);
+    goals.sort((a, b) => a.minute - b.minute);
+    matchPlanRef.current = { seed, goals };
+  };
+
+  const resolveGoalScorerName = (goal: PlannedGoal, fallback?: string) => {
+    const player = [...homeSquad, ...awaySquad].find(p => p.id === goal.scorerId);
+    return player?.name || fallback || (goal.team === 'home' ? homeClub.shortName : awayClub.shortName);
+  };
+
+  const getGoalBallPosition = (team: TeamSide, y: number) => ({
+    x: team === 'home' ? 100 : 0,
+    y: clamp(y, 45, 55)
+  });
+
+  const recordGoalEvent = (goal: PlannedGoal, fallbackScorer?: string) => {
+    const club = goal.team === 'home' ? homeClub : awayClub;
+    const scorerName = resolveGoalScorerName(goal, fallbackScorer);
+    const goalMinute = Math.max(1, goal.minute);
+    const scorerStr = `${goalMinute}'. ${scorerName} (${club.shortName})`;
+    const goalBallPosition = getGoalBallPosition(goal.team, goal.y);
+    const ballState = ballSimRef.current;
+
+    ballState.x = goalBallPosition.x;
+    ballState.y = goalBallPosition.y;
+    ballState.z = 0;
+    ballState.vx = 0;
+    ballState.vy = 0;
+    ballState.vz = 0;
+    ballState.ownerId = null;
+    ballState.lastTouchTeam = goal.team;
+    ballState.looseUntilTick = liveTickRef.current + 20;
+    ballState.deadUntilTick = Math.max(ballState.deadUntilTick, liveTickRef.current + 95);
+    ballPossessorIdRef.current = null;
+    activeAttackerIdRef.current = null;
+    intendedReceiverIdRef.current = null;
+    passerIdRef.current = null;
+    playPhaseRef.current = 'CELEBRATION';
+
+    scorersRef.current.push(scorerStr);
+    matchEventsRef.current.push({
+      minute: goalMinute,
+      type: 'GOAL',
+      teamId: club.id,
+      playerName: scorerName,
+      detail: 'Seed planına bağlı deterministik maç motorunda gelişen pozisyon.'
+    });
+
+    if (goal.team === 'home') {
+      setHomeScore(prev => prev + 1);
+      setHomeShots(prev => prev + 1);
+    } else {
+      setAwayScore(prev => prev + 1);
+      setAwayShots(prev => prev + 1);
+    }
+
+    setBall(goalBallPosition);
+    setBallTarget(goalBallPosition);
+    setLogs(prev => [
+      ...prev,
+      `${goalMinute}' [GOOOL] - ${club.name} seed planındaki golünü buldu! Gol: ${scorerName}`
+    ]);
+    setFxState({
+      type: 'GOAL',
+      text: `GOOOL! ${scorerName} • ${club.shortName}`,
+      team: goal.team,
+      x: goalBallPosition.x,
+      y: goalBallPosition.y
+    });
+  };
+
+  const consumeDuePlannedGoal = (team: TeamSide, minuteLimit: number) => {
+    const goal = matchPlanRef.current.goals.find(g => !g.played && g.team === team && g.minute <= minuteLimit);
+    if (!goal) return null;
+    goal.played = true;
+    return goal;
+  };
+
+  const triggerDuePlannedGoals = (minuteLimit: number) => {
+    matchPlanRef.current.goals
+      .filter(goal => !goal.played && goal.minute <= minuteLimit)
+      .forEach(goal => {
+        goal.played = true;
+        recordGoalEvent(goal);
+      });
+  };
 
   useEffect(() => {
     const pList = getInitialPositions(homeSquad, awaySquad, homeFormation, awayFormation);
@@ -680,6 +896,23 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
       };
 
       const registerGoal = (scoringTeam: TeamSide, scorer?: LivePitchPlayer | null) => {
+        const plannedGoal = consumeDuePlannedGoal(scoringTeam, minuteRef.current + 1);
+        if (!plannedGoal) {
+          ballState.x = clamp(ballState.x, 0, 100);
+          ballState.vx = -ballState.vx * 0.28;
+          ballState.vy *= 0.62;
+          ballState.vz = Math.max(0, ballState.vz) * 0.3;
+          ballState.looseUntilTick = tick + 10;
+          setFxState({
+            type: 'MISS',
+            text: 'Az farkla dışarı!',
+            team: scoringTeam,
+            x: scoringTeam === 'home' ? 98 : 2,
+            y: ballState.y
+          });
+          return;
+        }
+
         ballState.deadUntilTick = tick + 95;
         ballState.ownerId = null;
         ballState.vx = 0;
@@ -687,34 +920,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         ballState.vz = 0;
         ballPossessorIdRef.current = null;
         playPhaseRef.current = 'CELEBRATION';
-
-        const club = scoringTeam === 'home' ? homeClub : awayClub;
-        const scorerName = scorer?.name || (scoringTeam === 'home' ? homeClub.shortName : awayClub.shortName);
-        const goalMinute = Math.max(1, minuteRef.current);
-        const scorerStr = `${goalMinute}'. ${scorerName} (${club.shortName})`;
-        scorersRef.current.push(scorerStr);
-        matchEventsRef.current.push({
-          minute: goalMinute,
-          type: 'GOAL',
-          teamId: club.id,
-          playerName: scorerName,
-          detail: 'Canlı fizik motorunda gelişen pozisyon.'
-        });
-
-        if (scoringTeam === 'home') setHomeScore(prev => prev + 1);
-        else setAwayScore(prev => prev + 1);
-
-        setLogs(prev => [
-          ...prev,
-          `${goalMinute}' [GOOOL] - ${club.name} gerçek zamanlı akışta golü buldu! Gol: ${scorerName}`
-        ]);
-        setFxState({
-          type: 'GOAL',
-          text: `GOOOL! ${club.shortName}`,
-          team: scoringTeam,
-          x: scoringTeam === 'home' ? 98 : 2,
-          y: ballState.y
-        });
+        recordGoalEvent(plannedGoal, scorer?.name);
       };
 
       const kickBall = (kicker: LivePitchPlayer, targetX: number, targetY: number, power: number, loft: number) => {
@@ -1233,6 +1439,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         if (nextSec >= 60) {
           setMinute(prevMin => {
             const nextMin = prevMin + 1;
+            triggerDuePlannedGoals(nextMin);
             
             // Match Finished Trigger
             if (nextMin > 90) {
@@ -1241,6 +1448,8 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
               setShowMatchEndOverlay(true);
               setIsSimulating(false);
               setLogs(prev => [...prev, "ERSAN EFENDİ son düdüğü çalıyor! Maç sona erdi.", `Maç Sonucu: ${homeClub.name} ${homeScore} - ${awayScore} ${awayClub.name}`]);
+              soundEngine.playMatchEnd();
+              soundEngine.stopCrowd();
               
               // Triple referee whistle sound trigger!
               soundEngine.playWhistle(true);
@@ -1254,10 +1463,16 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
             if (nextMin === 45) {
               setLogs(prev => [...prev, "ERSAN EFENDİ ilk yarıyı bitiren düdüğü çalıyor. Devre arası.", `İlk Yarı Sonucu: ${homeClub.name} ${homeScore} - ${awayScore} ${awayClub.name}`]);
               setIsSimulating(false); // Pause at 45m for half-time break
+              soundEngine.playMatchEnd();
+              soundEngine.stopCrowd();
               soundEngine.playWhistle(true);
             }
             if (nextMin === 46) {
               setLogs(prev => [...prev, "ERSAN EFENDİ'nin işaretiyle ikinci yarı başladı! Bakalım antrenörlerin taktik hamleleri ne olacak."]);
+              soundEngine.playMatchStart();
+              if (matchViewMode === '3D') {
+                soundEngine.playCrowd();
+              }
               soundEngine.playWhistle(false);
             }
 
@@ -1265,6 +1480,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
             if (nextMin % 12 === 0 && nextMin !== 45) {
               const randomNormal = rngRef.current.choice(COMMENTARY_TEMPLATES.COMMENT_NORMAL);
               setLogs(prev => [...prev, `${nextMin}' ${randomNormal}`]);
+              soundEngine.playCommentaryTick();
             }
 
             return nextMin;
@@ -1276,7 +1492,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
     }, subTickDuration);
 
     return () => clearInterval(timer);
-  }, [isSimulating, minute, homeScore, awayScore, speed, matchDone, possession, homeShots, awayShots]);
+  }, [isSimulating, minute, homeScore, awayScore, speed, matchDone, possession, homeShots, awayShots, matchViewMode]);
 
   // Main algorithm inside tactical simulation
   const simulateMatchAction = (currMin: number) => {
@@ -1536,7 +1752,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
   // Perform Substitution
   const handleSubstitution = (starterId: string, benchId: string) => {
     if (subCount >= 5) {
-      alert("En fazla 5 oyuncu değişikliği yapabilirsiniz.");
+      onNotify?.('Oyuncu Değişikliği Limiti', 'En fazla 5 oyuncu değişikliği yapabilirsiniz.', 'warning');
       return;
     }
 
@@ -1552,6 +1768,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
 
       setSubCount(prev => prev + 1);
       setLogs(prev => [...prev, `${minute}' [Oyuncu Değişikliği] - ${starterPlayer.name} oyundan çıkıyor, yerine ${benchPlayer.name} dahil oluyor.`]);
+      soundEngine.playCommentaryTick();
       
       matchEventsRef.current.push({
         minute,
@@ -1790,11 +2007,17 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
               resetLivePhysics();
               const alignedPlayers = getInitialPositions(homeSquad, awaySquad, homeFormation, awayFormation);
               setPitchPlayers(alignedPlayers);
+              prepareMatchPlan(matchSeed);
               setLogs([
                 "Müsabaka öncesi son taktik planlar yapıldı ve oyuncular sahaya dağıldı.",
                 `Hakem düdüğü ağzına götürdü... Ve dev mücadele başlıyor!`
               ]);
               setIsSimulating(true);
+              soundEngine.playMatchStart();
+              soundEngine.playWhistle(true);
+              if (matchViewMode === '3D') {
+                soundEngine.playCrowd();
+              }
             }}
             className="px-10 py-4 bg-[#FF007A] text-white hover:bg-[#ff1a8c] font-black rounded-2xl flex items-center gap-3 shadow-lg shadow-rose-500/10 cursor-pointer text-sm sm:text-base tracking-widest scale-100 hover:scale-[1.03] transition-all"
           >
@@ -1806,74 +2029,72 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
   }
 
   return (
-    <div className="bg-zinc-950 p-4 sm:p-6 rounded-3xl border border-zinc-805 shadow-2xl space-y-5" id="match-day-engine">
+    <div className="bg-zinc-950 p-2.5 sm:p-5 rounded-2xl sm:rounded-3xl border border-zinc-800 shadow-2xl space-y-2.5 sm:space-y-5" id="match-day-engine">
       {/* Match Banner scoreboard */}
-      <div className="bg-gradient-to-r from-zinc-900 to-zinc-950 p-6 rounded-3xl border border-zinc-800 flex flex-col sm:flex-row justify-between items-center gap-6 relative overflow-hidden">
-        <div className="absolute top-0 right-1/2 translate-x-1/2 w-20 h-20 bg-[#FF007A]/10 rounded-full blur-2xl pointer-events-none" />
+      <div className="bg-gradient-to-r from-zinc-900 to-zinc-950 px-2.5 py-2 sm:p-5 rounded-2xl sm:rounded-3xl border border-zinc-800 grid grid-cols-[1fr_auto_1fr] items-center gap-2 sm:gap-5 relative overflow-hidden">
 
         {/* Home Club */}
-        <div className="flex items-center gap-4 text-center sm:text-left flex-1 justify-end">
-          <div className="space-y-1">
-            <h3 className="text-sm sm:text-lg font-bold text-zinc-100">{homeClub.name}</h3>
-            <p className="text-[10px] text-zinc-500 font-mono font-bold uppercase tracking-wider">OVR: {homeOvr}</p>
+        <div className="flex items-center gap-2 min-w-0 justify-end">
+          <div className="min-w-0 text-right leading-none">
+            <h3 className="text-[11px] sm:text-lg font-black text-zinc-100 truncate">{homeClub.shortName || homeClub.name}</h3>
+            <p className="text-[8px] sm:text-[10px] text-zinc-500 font-mono font-bold uppercase tracking-wider mt-1">OVR {homeOvr}</p>
           </div>
           <img 
             src={homeClub.badge} 
             alt={homeClub.name} 
-            className="w-12 h-12 object-contain"
+            className="w-7 h-7 sm:w-12 sm:h-12 object-contain shrink-0"
             referrerPolicy="no-referrer"
           />
         </div>
 
         {/* Live Score Counter */}
-        <div className="flex flex-col items-center shrink-0 border-x border-zinc-800/80 px-8">
-          <span className="text-zinc-500 font-mono text-xs uppercase font-bold tracking-widest">SÜRE</span>
-          <span className="text-[#FF007A] font-mono text-xl sm:text-2xl font-bold tracking-widest animate-pulse mt-0.5">
+        <div className="flex flex-col items-center shrink-0 border-x border-zinc-800/80 px-3 sm:px-8">
+          <span className="text-[#FF007A] font-mono text-[11px] sm:text-2xl font-black tracking-widest animate-pulse leading-none">
             {String(minute).padStart(2, '0')}:{String(second).padStart(2, '0')}
           </span>
           
-          <div className="flex items-center gap-4 mt-2">
-            <span className="text-3xl sm:text-4xl font-mono font-bold text-zinc-100">{homeScore}</span>
-            <span className="text-zinc-500 font-mono font-bold text-lg">-</span>
-            <span className="text-3xl sm:text-4xl font-mono font-bold text-zinc-100">{awayScore}</span>
+          <div className="flex items-center gap-2 sm:gap-4 mt-1 sm:mt-2 leading-none">
+            <span className="text-2xl sm:text-4xl font-mono font-black text-zinc-100">{homeScore}</span>
+            <span className="text-zinc-500 font-mono font-bold text-xs sm:text-lg">-</span>
+            <span className="text-2xl sm:text-4xl font-mono font-black text-zinc-100">{awayScore}</span>
           </div>
 
-          <div className="mt-3">
+          <div className="mt-1.5 sm:mt-3">
             {matchDone ? (
-              <span className="text-[9px] bg-zinc-800 border border-zinc-700 text-zinc-300 px-2 py-1 rounded-full uppercase font-mono font-bold">MAÇ BİTTİ</span>
+              <span className="text-[7px] sm:text-[9px] bg-zinc-800 border border-zinc-700 text-zinc-300 px-1.5 sm:px-2 py-0.5 sm:py-1 rounded-full uppercase font-mono font-bold">BİTTİ</span>
             ) : isSimulating ? (
-              <span className="text-[9px] bg-red-500/10 border border-red-500/20 text-rose-400 px-2.5 py-1 rounded-full uppercase font-mono font-bold flex items-center gap-1">
-                <span className="w-1.5 h-1.5 bg-red-500 rounded-full animate-ping" /> CANLI OYNANIYOR
+              <span className="text-[7px] sm:text-[9px] bg-red-500/10 border border-red-500/20 text-rose-400 px-1.5 sm:px-2.5 py-0.5 sm:py-1 rounded-full uppercase font-mono font-bold flex items-center gap-1">
+                <span className="w-1 h-1 sm:w-1.5 sm:h-1.5 bg-red-500 rounded-full animate-ping" /> CANLI
               </span>
             ) : (
-              <span className="text-[9px] bg-yellow-500/10 border border-yellow-500/20 text-yellow-500 px-2.5 py-1 rounded-full uppercase font-mono font-bold">DURDURULDU</span>
+              <span className="text-[7px] sm:text-[9px] bg-yellow-500/10 border border-yellow-500/20 text-yellow-500 px-1.5 sm:px-2.5 py-0.5 sm:py-1 rounded-full uppercase font-mono font-bold">DURDU</span>
             )}
           </div>
         </div>
 
         {/* Away Club */}
-        <div className="flex items-center gap-4 text-center sm:text-right flex-1 justify-start flex-row-reverse sm:flex-row">
+        <div className="flex items-center gap-2 min-w-0 justify-start">
           <img 
             src={awayClub.badge} 
             alt={awayClub.name} 
-            className="w-12 h-12 object-contain"
+            className="w-7 h-7 sm:w-12 sm:h-12 object-contain shrink-0"
             referrerPolicy="no-referrer"
           />
-          <div className="space-y-1">
-            <h3 className="text-sm sm:text-lg font-bold text-zinc-100">{awayClub.name}</h3>
-            <p className="text-[10px] text-zinc-500 font-mono font-bold uppercase tracking-wider">OVR: {awayOvr}</p>
+          <div className="min-w-0 text-left leading-none">
+            <h3 className="text-[11px] sm:text-lg font-black text-zinc-100 truncate">{awayClub.shortName || awayClub.name}</h3>
+            <p className="text-[8px] sm:text-[10px] text-zinc-500 font-mono font-bold uppercase tracking-wider mt-1">OVR {awayOvr}</p>
           </div>
         </div>
       </div>
 
       {/* High-Definition Stadyum Görünüm Sekmeleri & Tohum Kontrolü */}
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
-        <div className="flex items-center gap-2">
-          <div className="flex gap-2 p-1 bg-zinc-900/60 border border-zinc-800/80 rounded-2xl max-w-xs shadow-md">
+      <div className="flex items-center gap-2 overflow-x-auto pb-0.5 sm:justify-between">
+        <div className="flex items-center gap-2 shrink-0">
+          <div className="flex gap-1 p-1 bg-zinc-900/60 border border-zinc-800/80 rounded-2xl shadow-md">
             <button
               type="button"
               onClick={() => setMatchViewMode('3D')}
-              className={`flex-1 py-1.5 px-4 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 cursor-pointer ${
+              className={`py-1.5 px-3 sm:px-4 rounded-xl text-[10px] sm:text-xs font-bold transition-all flex items-center justify-center gap-1.5 sm:gap-2 cursor-pointer whitespace-nowrap ${
                 matchViewMode === '3D'
                   ? 'bg-[#FF007A] text-white shadow-md font-black scale-[1.02]'
                   : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/30'
@@ -1884,9 +2105,9 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
             <button
               type="button"
               onClick={() => setMatchViewMode('2D')}
-              className={`flex-1 py-1.5 px-4 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 cursor-pointer ${
+              className={`py-1.5 px-3 sm:px-4 rounded-xl text-[10px] sm:text-xs font-bold transition-all flex items-center justify-center gap-1.5 sm:gap-2 cursor-pointer whitespace-nowrap ${
                 matchViewMode === '2D'
-                  ? 'bg-zinc-805 text-zinc-100 shadow-md font-black scale-[1.02]'
+                  ? 'bg-zinc-800 text-zinc-100 shadow-md font-black scale-[1.02]'
                   : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/30'
               }`}
             >
@@ -1900,7 +2121,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
               const nextMute = soundEngine.toggleMute();
               setSoundMuted(nextMute);
             }}
-            className={`p-2.5 rounded-2xl border transition-all flex items-center justify-center cursor-pointer ${
+            className={`p-2 rounded-2xl border transition-all flex items-center justify-center cursor-pointer ${
               soundMuted 
                 ? 'bg-red-500/10 border-red-500/20 text-red-400' 
                 : 'bg-zinc-900/60 border-zinc-800/80 text-zinc-300 hover:text-white'
@@ -1912,8 +2133,8 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         </div>
 
         {/* Maç Tohumu Seed Girişi */}
-        <div className="flex items-center gap-2 bg-zinc-900/45 border border-zinc-800/80 px-3 py-1.5 rounded-2xl text-xs shadow-sm shadow-black shrink-0">
-          <span className="text-[10px] text-zinc-400 font-mono font-bold uppercase tracking-wider">Tohum (Seed):</span>
+        <div className="flex items-center gap-1.5 bg-zinc-900/45 border border-zinc-800/80 px-2 py-1 rounded-2xl text-xs shadow-sm shadow-black shrink-0 ml-auto">
+          <span className="text-[9px] text-zinc-400 font-mono font-bold uppercase tracking-wider">Seed</span>
           <input
             type="number"
             value={matchSeed}
@@ -1921,13 +2142,13 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
               const val = parseInt(e.target.value) || 0;
               setMatchSeed(val);
             }}
-            className="bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1 text-[11px] font-mono font-black text-zinc-200 focus:outline-none focus:border-[#FF007A] w-32 text-center"
+            className="bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1 text-[10px] sm:text-[11px] font-mono font-black text-zinc-200 focus:outline-none focus:border-[#FF007A] w-24 sm:w-32 text-center"
             placeholder="Tohum No"
           />
           <button
             type="button"
             onClick={() => {
-              const rVal = Math.floor(1000000000 + Math.random() * 900000000);
+              const rVal = Math.floor(Date.now() / 1000);
               setMatchSeed(rVal);
             }}
             className="p-1 text-[#FF007A] hover:bg-zinc-800 rounded-lg transition-all"
@@ -1938,7 +2159,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
         </div>
       </div>
 
-      <div className="relative rounded-[32px] overflow-hidden bg-zinc-950 border border-zinc-850/80 shadow-2xl">
+      <div className="relative rounded-2xl sm:rounded-[32px] overflow-hidden bg-zinc-950 border border-zinc-800/80 shadow-2xl">
         {matchViewMode === '3D' ? (
           <ThreeDPitch
             pitchPlayers={pitchPlayers}
@@ -2076,65 +2297,65 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
           <div className="absolute inset-0 bg-[#07080a]/92 backdrop-blur-md flex flex-col justify-center items-center p-4 sm:p-6 z-[100] animate-fade-in text-center select-none">
             <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-indigo-500/10 via-transparent to-transparent pointer-events-none" />
             
-            <div className="max-w-md w-full bg-zinc-900 border border-zinc-801 p-6 rounded-[28px] shrink-0 shadow-2xl relative z-10 space-y-4 animate-scale-up">
+            <div className="max-w-md w-full bg-zinc-50 border border-zinc-200 p-6 rounded-[28px] shrink-0 shadow-2xl relative z-10 space-y-4 animate-scale-up text-zinc-950">
               
               <div className="flex flex-col items-center space-y-1">
                 <div className="w-11 h-11 bg-amber-500/15 border border-amber-500/30 rounded-full flex items-center justify-center text-amber-500 shadow-md shadow-amber-500/5">
                   <Trophy className="w-5.5 h-5.5 animate-bounce" style={{ animationDuration: '3.5s' }} />
                 </div>
-                <h2 className="text-lg font-black text-white font-mono tracking-wider mt-1.5">MAÇ SONA ERDİ!</h2>
-                <p className="text-[10px] text-zinc-400 font-mono">DÜDÜK: <span className="text-emerald-400 font-black uppercase">ERSAN EFENDİ</span></p>
+                <h2 className="text-lg font-black text-zinc-950 font-mono tracking-wider mt-1.5">MAÇ SONA ERDİ!</h2>
+                <p className="text-[10px] text-zinc-600 font-mono">DÜDÜK: <span className="text-emerald-700 font-black uppercase">ERSAN EFENDİ</span></p>
               </div>
 
               {/* Glowing scoreboard row */}
-              <div className="flex items-center justify-between bg-zinc-950/70 p-3.5 rounded-2xl border border-zinc-900 shadow-inner">
+              <div className="flex items-center justify-between bg-white p-3.5 rounded-2xl border border-zinc-200 shadow-inner">
                 <div className="flex flex-col items-center flex-1 space-y-1">
                   <img src={homeClub.badge} alt={homeClub.name} className="w-9 h-9 object-contain" referrerPolicy="no-referrer" />
-                  <span className="text-[10px] font-black text-zinc-300 truncate max-w-[90px]">{homeClub.shortName}</span>
+                  <span className="text-[10px] font-black text-zinc-800 truncate max-w-[90px]">{homeClub.shortName}</span>
                 </div>
                 
                 <div className="flex flex-col items-center shrink-0 px-3">
                   <div className="flex items-center gap-3">
-                    <span className="text-2xl font-mono font-black text-white">{homeScore}</span>
-                    <span className="text-zinc-650 font-black text-base">-</span>
-                    <span className="text-2xl font-mono font-black text-white">{awayScore}</span>
+                    <span className="text-2xl font-mono font-black text-zinc-950">{homeScore}</span>
+                    <span className="text-zinc-500 font-black text-base">-</span>
+                    <span className="text-2xl font-mono font-black text-zinc-950">{awayScore}</span>
                   </div>
                   <span className="text-[8px] text-[#FF007A] uppercase font-black tracking-widest font-mono mt-0.5">90' FINAL RAPORU</span>
                 </div>
 
                 <div className="flex flex-col items-center flex-1 space-y-1">
                   <img src={awayClub.badge} alt={awayClub.name} className="w-9 h-9 object-contain" referrerPolicy="no-referrer" />
-                  <span className="text-[10px] font-black text-zinc-300 truncate max-w-[90px]">{awayClub.shortName}</span>
+                  <span className="text-[10px] font-black text-zinc-800 truncate max-w-[90px]">{awayClub.shortName}</span>
                 </div>
               </div>
 
               {/* Scorers Section with Football symbol representation */}
               <div className="space-y-1 max-h-[105px] overflow-y-auto pr-1">
-                <p className="text-[9px] uppercase font-mono font-bold text-zinc-500 text-left pl-1">GOL ATANLAR</p>
+                <p className="text-[9px] uppercase font-mono font-bold text-zinc-700 text-left pl-1">GOL ATANLAR</p>
                 {scorersRef.current && scorersRef.current.length > 0 ? (
                   <div className="space-y-1">
                     {scorersRef.current.map((sc, idx) => (
-                      <div key={idx} className="flex justify-between items-center bg-zinc-950/40 px-3 py-1 border border-zinc-900 rounded-xl text-[10px] text-zinc-300">
+                      <div key={idx} className="flex justify-between items-center bg-white px-3 py-1 border border-zinc-200 rounded-xl text-[10px] text-zinc-800">
                         <span className="font-semibold flex items-center gap-1.5">
-                          <span className="text-emerald-500 text-[10px]">⚽</span> {sc.split(' (')[0]}
+                          <span className="text-emerald-600 text-[10px]">⚽</span> {sc.split(' (')[0]}
                         </span>
-                        <span className="font-mono text-[9px] text-zinc-500 font-bold">{sc.split(' (')[1]?.replace(')', '') || 'GOL'}</span>
+                        <span className="font-mono text-[9px] text-zinc-600 font-bold">{sc.split(' (')[1]?.replace(')', '') || 'GOL'}</span>
                       </div>
                     ))}
                   </div>
                 ) : (
-                  <div className="text-[10px] font-mono text-zinc-500 bg-zinc-950/20 py-2.5 rounded-xl text-center">
+                  <div className="text-[10px] font-mono text-zinc-700 bg-white border border-zinc-200 py-2.5 rounded-xl text-center">
                     Bu karşılaşmada gol sesi çıkmadı.
                   </div>
                 )}
               </div>
 
               {/* Actions */}
-              <div className="space-y-2 pt-2.5 border-t border-zinc-800">
+              <div className="space-y-2 pt-2.5 border-t border-zinc-200">
                 <button
                   type="button"
                   onClick={() => setShowMatchEndOverlay(false)}
-                  className="w-full py-2 bg-zinc-950 hover:bg-zinc-900 border border-zinc-800 text-zinc-200 font-black text-[10px] sm:text-xs rounded-xl flex items-center justify-center gap-2 transition-all cursor-pointer shadow-md"
+                  className="w-full py-2 bg-white hover:bg-zinc-100 border border-zinc-300 text-zinc-950 font-black text-[10px] sm:text-xs rounded-xl flex items-center justify-center gap-2 transition-all cursor-pointer shadow-md"
                 >
                   <Eye className="w-3.5 h-3.5 text-[#FF007A]" />
                   SAHAYI İNCELE & TEKRAR SEYRET
@@ -2278,7 +2499,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
                   </div>
                   <div className="w-full h-1.5 bg-zinc-800 rounded-full overflow-hidden flex">
                     <div className="bg-[#FF007A]" style={{ width: `${possession}%` }}></div>
-                    <div className="bg-zinc-650" style={{ width: `${100 - possession}%` }}></div>
+                    <div className="bg-zinc-600" style={{ width: `${100 - possession}%` }}></div>
                   </div>
                 </div>
 
@@ -2334,7 +2555,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
             {!matchDone && (
               <div className="flex items-center gap-1.5 p-0.5 bg-zinc-900 rounded-xl border border-zinc-800 font-mono text-[9px]">
                 <button
-                  onClick={() => setIsSimulating(!isSimulating)}
+                  onClick={toggleSimulation}
                   className="p-1 px-2.5 rounded-lg hover:text-white hover:bg-zinc-800 font-bold flex items-center gap-1"
                 >
                   {isSimulating ? <Pause className="w-2.5 h-2.5" /> : <Play className="w-2.5 h-2.5" />}
@@ -2380,7 +2601,7 @@ export default function MatchEngine({ homeClub, awayClub, homeSquad, awaySquad, 
       {subsModalOpen && (
         <div className="fixed inset-0 bg-black/75 backdrop-blur-md flex items-center justify-center p-4 z-50">
           <div className="bg-zinc-950 border border-zinc-800 max-w-lg w-full rounded-3xl p-6 space-y-4">
-            <div className="flex justify-between items-center border-b border-zinc-805 pb-3">
+            <div className="flex justify-between items-center border-b border-zinc-800 pb-3">
               <h3 className="text-base font-bold text-zinc-100 flex items-center gap-2">
                 <RefreshCw className="w-5 h-5 text-[#FF007A]" /> Oyuncu Değişikliği (Yedekler)
               </h3>

@@ -66,54 +66,49 @@ export default function BroadcastBanner({ fxState, homeClub, awayClub }: Broadca
 
   return (
     <AnimatePresence>
-      <div className="absolute left-4 top-14 pointer-events-none z-50 flex items-start justify-start">
+      <div className="absolute inset-x-2 sm:left-4 sm:right-auto top-10 sm:top-14 pointer-events-none z-50 flex items-start justify-center sm:justify-start">
         
-        {/* 1. SEAMLESS GLASSY TRANSPARENT COMPACT GOAL HUD */}
+        {/* 1. High-contrast TV-style compact goal flash */}
          {animationType === 'GOAL' && (
           <motion.div
-            initial={{ x: -250, opacity: 0, scale: 0.95 }}
-            animate={{ x: 0, opacity: 1, scale: 1 }}
-            exit={{ x: -250, opacity: 0, scale: 0.95 }}
-            transition={{ type: 'spring', stiffness: 220, damping: 22 }}
-            className="w-72 sm:w-80 bg-zinc-950/90 backdrop-blur-md rounded-2xl border border-rose-500/70 p-3 flex flex-col gap-2 shadow-lg relative overflow-hidden pointer-events-auto"
-            style={{ boxShadow: '0 4px 20px rgba(225, 29, 72, 0.25)' }}
+            initial={{ y: -20, opacity: 0, scale: 0.98 }}
+            animate={{ y: 0, opacity: 1, scale: 1 }}
+            exit={{ y: -20, opacity: 0, scale: 0.98 }}
+            transition={{ type: 'spring', stiffness: 260, damping: 24 }}
+            className="w-full max-w-[360px] sm:w-[380px] bg-[#09090b]/96 backdrop-blur-xl rounded-2xl border-2 border-rose-500/70 px-3.5 py-3 sm:px-4 flex items-center gap-3 shadow-2xl relative overflow-hidden"
+            style={{ boxShadow: '0 18px 42px rgba(0,0,0,0.58), 0 0 28px rgba(225,29,72,0.36)' }}
           >
-            {/* Elegant horizontal status top bar */}
-            <div className="absolute top-0 inset-x-0 h-0.5 bg-rose-500" />
+            <div className="absolute inset-0 bg-gradient-to-r from-rose-700/34 via-zinc-950/0 to-zinc-950/0 pointer-events-none" />
+            <div className="absolute inset-x-0 top-0 h-1 bg-rose-500 pointer-events-none" />
             
-            <div className="flex items-center gap-2">
-              <motion.div
-                animate={{ rotate: 360 }}
-                transition={{ repeat: Infinity, duration: 12, ease: 'linear' }}
-                className="w-7 h-7 bg-gradient-to-tr from-rose-600 to-amber-500 text-white rounded-full flex items-center justify-center text-xs font-bold shrink-0 select-none shadow"
-              >
-                ⚽
-              </motion.div>
+            {activeClub && (
+              <img 
+                src={activeClub.badge} 
+                alt={activeClub.name} 
+                className="w-10 h-10 sm:w-11 sm:h-11 object-contain shrink-0 relative z-10 rounded-full bg-white p-1 shadow-lg"
+                referrerPolicy="no-referrer"
+              />
+            )}
 
-              <div>
-                <span className="px-1.5 py-0.2 bg-rose-500/15 border border-rose-500/30 rounded text-[7px] font-mono font-black tracking-widest text-rose-300 uppercase animate-pulse leading-none">
+            <div className="min-w-0 flex-1 relative z-10 leading-none">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="inline-flex max-w-full items-center rounded-full bg-rose-600 px-2 py-1 text-[9px] font-mono font-black tracking-widest text-white uppercase shadow-sm">
                   {titleText}
                 </span>
-                <h2 className="text-sm font-black tracking-tight text-white uppercase mt-0.5 leading-none shadow-sm">
-                  G O O O L !
+                <span className="h-1.5 w-1.5 rounded-full bg-white shadow-[0_0_10px_rgba(255,255,255,0.8)] animate-ping shrink-0" />
+              </div>
+              <div className="mt-1.5 min-w-0">
+                <h2 className="text-2xl sm:text-3xl font-black tracking-normal text-white uppercase leading-none drop-shadow-[0_2px_8px_rgba(0,0,0,0.9)]">
+                  GOOOL
                 </h2>
+                <p className="mt-1 max-w-full rounded-lg bg-white px-2 py-1 text-[12px] sm:text-sm font-black text-zinc-950 truncate shadow-sm">
+                  {cleanDesc || activeClub?.shortName || 'Gol'}
+                </p>
               </div>
             </div>
 
-            {/* Scorer Player Name Text and Team badge */}
-            <div className="flex items-center gap-2 bg-zinc-900/40 border border-zinc-850 px-2.5 py-1.5 rounded-lg">
-              {activeClub && (
-                <img 
-                  src={activeClub.badge} 
-                  alt={activeClub.name} 
-                  className="w-5 h-5 object-contain"
-                  referrerPolicy="no-referrer"
-                />
-              )}
-              <div className="min-w-0">
-                <p className="text-[8px] text-zinc-400 font-mono font-bold uppercase truncate leading-none">{activeClub?.name || 'TAKIM'}</p>
-                <p className="text-[11px] font-black text-rose-400 mt-0.5 font-sans leading-tight truncate">{cleanDesc || 'Oyuncu'}</p>
-              </div>
+            <div className="text-[9px] font-mono font-black text-white border border-white/25 rounded-full px-2 py-1 bg-zinc-950 relative z-10 shrink-0 shadow-sm">
+              LIVE
             </div>
           </motion.div>
         )}
@@ -170,7 +165,7 @@ export default function BroadcastBanner({ fxState, homeClub, awayClub }: Broadca
                 </span>
 
                 {activeClub && (
-                  <span className="inline-flex items-center gap-0.5 bg-zinc-900 border border-zinc-800 px-1 py-0.2 rounded text-[7px] font-mono text-zinc-400">
+                  <span className="inline-flex items-center gap-0.5 bg-zinc-900 border border-zinc-800 px-1 py-[1px] rounded text-[7px] font-mono text-zinc-400">
                     {activeClub.shortName}
                   </span>
                 )}
